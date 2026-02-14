@@ -1,0 +1,12 @@
+# Go build outputs
+bin/
+dist/
+*.test
+*.out
+
+# Coverage
+coverage.out
+
+# Local env files
+.env
+.env.*

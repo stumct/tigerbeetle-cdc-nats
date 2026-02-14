@@ -1,0 +1,44 @@
+services:
+  nats:
+    image: nats:2.12-alpine
+    command: ["-js", "--store_dir", "/data"]
+    ports:
+      - "127.0.0.1:${TB_CDC_NATS_PORT:-14222}:4222"
+    volumes:
+      - nats_data:/data
+
+  tigerbeetle-format:
+    image: ghcr.io/tigerbeetle/tigerbeetle:${TB_CDC_TIGERBEETLE_TAG:-latest}
+    command:
+      [
+        "format",
+        "--cluster=${TB_CDC_CLUSTER_ID:-0}",
+        "--replica=0",
+        "--replica-count=1",
+        "--development",
+        "/data/0_0.tigerbeetle",
+      ]
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - tb_data:/data
+
+  tigerbeetle:
+    image: ghcr.io/tigerbeetle/tigerbeetle:${TB_CDC_TIGERBEETLE_TAG:-latest}
+    command:
+      [
+        "start",
+        "--addresses=0.0.0.0:3000",
+        "--development",
+        "/data/0_0.tigerbeetle",
+      ]
+    security_opt:
+      - seccomp=unconfined
+    ports:
+      - "127.0.0.1:${TB_CDC_TIGERBEETLE_PORT:-13000}:3000"
+    volumes:
+      - tb_data:/data
+
+volumes:
+  nats_data:
+  tb_data:
