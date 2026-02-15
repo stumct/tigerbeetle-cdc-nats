@@ -21,7 +21,7 @@ jobs:
             goos: linux
             goarch: amd64
             ext: ""
-          - runner: macos-13
+          - runner: macos-15-intel
             goos: darwin
             goarch: amd64
             ext: ""
