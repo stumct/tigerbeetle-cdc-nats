@@ -20,7 +20,7 @@ It mirrors `tigerbeetle amqp` semantics while taking advantage of JetStream:
 2) Install the CLI from GitHub Releases:
 
 ```bash
-VERSION=v0.1.1
+VERSION=v0.1.2
 OS=linux   # linux or darwin
 ARCH=amd64 # amd64 or arm64
 ASSET="tb-cdc-nats_${VERSION}_${OS}_${ARCH}.tar.gz"
@@ -100,7 +100,7 @@ Release checksums are published in `SHA256SUMS.txt`.
 Example install (Linux amd64):
 
 ```bash
-VERSION=v0.1.1
+VERSION=v0.1.2
 ASSET="tb-cdc-nats_${VERSION}_linux_amd64.tar.gz"
 BASE_URL="https://github.com/stumct/tigerbeetle-cdc-nats/releases/download/${VERSION}"
 
