@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	cdcnats "github.com/tigerbeetle/tigerbeetle-cdc-nats"
+	cdcnats "github.com/stumct/tigerbeetle-cdc-nats"
 )
 
 var buildVersion = "dev"

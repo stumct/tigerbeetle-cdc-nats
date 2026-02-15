@@ -1,4 +1,4 @@
-module github.com/tigerbeetle/tigerbeetle-cdc-nats
+module github.com/stumct/tigerbeetle-cdc-nats
 
 go 1.23.0
 

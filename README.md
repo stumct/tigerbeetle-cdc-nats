@@ -10,6 +10,48 @@ It mirrors `tigerbeetle amqp` semantics while taking advantage of JetStream:
 - Stores progress and lock state in JetStream KV (stateless runner)
 - Uses deterministic `Nats-Msg-Id` (`<cluster>/<timestamp>`) for de-duplication
 
+## Getting started in 5 minutes
+
+1) Make sure these are running:
+
+- TigerBeetle replicas reachable by `--addresses` (example: `127.0.0.1:3000`)
+- NATS with JetStream enabled (example: `nats://127.0.0.1:4222`)
+
+2) Install the CLI from GitHub Releases:
+
+```bash
+VERSION=v0.1.1
+OS=linux   # linux or darwin
+ARCH=amd64 # amd64 or arm64
+ASSET="tb-cdc-nats_${VERSION}_${OS}_${ARCH}.tar.gz"
+BASE_URL="https://github.com/stumct/tigerbeetle-cdc-nats/releases/download/${VERSION}"
+
+curl -L -O "${BASE_URL}/${ASSET}"
+curl -L -O "${BASE_URL}/SHA256SUMS.txt"
+grep " ${ASSET}$" SHA256SUMS.txt | sha256sum -c -
+tar -xzf "${ASSET}"
+sudo install -m 0755 tb-cdc-nats /usr/local/bin/tb-cdc-nats
+```
+
+If your system does not have `sha256sum` (for example, macOS), use `shasum -a 256` for verification.
+
+3) Start the publisher:
+
+```bash
+tb-cdc-nats \
+  --cluster-id=0 \
+  --addresses=127.0.0.1:3000 \
+  --nats-url=nats://127.0.0.1:4222
+```
+
+The first run auto-provisions the JetStream stream and KV buckets (unless `--provision=false`).
+
+4) Optional: verify messages are arriving:
+
+```bash
+nats --server nats://127.0.0.1:4222 sub 'tigerbeetle.cdc.>'
+```
+
 ## Delivery semantics
 
 - Delivery is **at-least-once**.
@@ -40,21 +82,7 @@ Headers include:
 
 ## Install options
 
-### 1) Go install (recommended)
-
-Short binary name:
-
-```bash
-go install github.com/tigerbeetle/tigerbeetle-cdc-nats/cmd/tb-cdc-nats@latest
-```
-
-Compatibility binary name:
-
-```bash
-go install github.com/tigerbeetle/tigerbeetle-cdc-nats/cmd/tigerbeetle-cdc-nats@latest
-```
-
-### 2) Prebuilt release binaries
+### 1) Prebuilt release binaries (recommended)
 
 Download from GitHub Releases and install manually:
 
@@ -72,34 +100,49 @@ Release checksums are published in `SHA256SUMS.txt`.
 Example install (Linux amd64):
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.1.1
 ASSET="tb-cdc-nats_${VERSION}_linux_amd64.tar.gz"
-BASE_URL="https://github.com/tigerbeetle/tigerbeetle-cdc-nats/releases/download/${VERSION}"
+BASE_URL="https://github.com/stumct/tigerbeetle-cdc-nats/releases/download/${VERSION}"
 
 curl -L -O "${BASE_URL}/${ASSET}"
 curl -L -O "${BASE_URL}/SHA256SUMS.txt"
 grep " ${ASSET}$" SHA256SUMS.txt | sha256sum -c -
 tar -xzf "${ASSET}"
-install -m 0755 tb-cdc-nats /usr/local/bin/tb-cdc-nats
+sudo install -m 0755 tb-cdc-nats /usr/local/bin/tb-cdc-nats
 ```
 
-### 3) Docker image
+### 2) Docker image
 
 Published to GHCR on tags:
 
 ```bash
-docker run --rm ghcr.io/<owner>/tigerbeetle-cdc-nats:latest --help
+docker run --rm ghcr.io/stumct/tigerbeetle-cdc-nats:latest --help
 ```
 
 For runtime usage, pass your normal flags and networking configuration (for example, `--nats-url` and `--addresses`) to the container entrypoint.
 
-## Quick start
+Example:
 
 ```bash
-go run ./cmd/tb-cdc-nats \
+docker run --rm --network host ghcr.io/stumct/tigerbeetle-cdc-nats:latest \
   --cluster-id=0 \
   --addresses=127.0.0.1:3000 \
   --nats-url=nats://127.0.0.1:4222
+```
+
+For Docker Desktop (macOS/Windows), use `host.docker.internal` instead of `127.0.0.1`, or run on a shared Docker network.
+
+### 3) Build from source (development)
+
+```bash
+go build -o tb-cdc-nats ./cmd/tb-cdc-nats
+./tb-cdc-nats --help
+```
+
+### 4) Go install (latest tag)
+
+```bash
+go install github.com/stumct/tigerbeetle-cdc-nats/cmd/tb-cdc-nats@latest
 ```
 
 ## Core flags
@@ -197,7 +240,7 @@ GitHub Actions workflow `/.github/workflows/tests.yml` runs:
 Tag-based workflow `/.github/workflows/release.yml` publishes:
 
 - release binaries + `SHA256SUMS.txt`
-- multi-arch Docker image to `ghcr.io/<owner>/tigerbeetle-cdc-nats`
+- multi-arch Docker image to `ghcr.io/stumct/tigerbeetle-cdc-nats`
 
 ## License
 
