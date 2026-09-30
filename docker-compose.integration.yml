@@ -8,7 +8,7 @@ services:
       - nats_data:/data
 
   tigerbeetle-format:
-    image: ghcr.io/tigerbeetle/tigerbeetle:${TB_CDC_TIGERBEETLE_TAG:-latest}
+    image: ghcr.io/tigerbeetle/tigerbeetle:${TB_CDC_TIGERBEETLE_TAG:-0.17.9}
     command:
       [
         "format",
@@ -24,7 +24,7 @@ services:
       - tb_data:/data
 
   tigerbeetle:
-    image: ghcr.io/tigerbeetle/tigerbeetle:${TB_CDC_TIGERBEETLE_TAG:-latest}
+    image: ghcr.io/tigerbeetle/tigerbeetle:${TB_CDC_TIGERBEETLE_TAG:-0.17.9}
     command:
       [
         "start",

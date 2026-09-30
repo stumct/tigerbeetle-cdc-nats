@@ -4,3 +4,4 @@ bin
 dist
 *.out
 coverage.out
+.worktrees
