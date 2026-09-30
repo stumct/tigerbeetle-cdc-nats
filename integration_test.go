@@ -252,7 +252,7 @@ func startRunner(t *testing.T, cfg config) (func(), chan error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		defer close(runnerDone)
-		runErrCh <- run(ctx, cfg)
+		runErrCh <- run(ctx, cfg, openTigerBeetle)
 	}()
 
 	stop := func() {

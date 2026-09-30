@@ -20,10 +20,15 @@ func RunCLI(args []string, version string) int {
 		return 2
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	// After the first signal, restore default handling so a second signal exits immediately.
+	context.AfterFunc(ctx, func() {
+		log.Printf("shutdown requested; stopping (signal again to exit immediately)")
+		stop()
+	})
 
-	if err := run(ctx, cfg); err != nil {
+	if err := run(ctx, cfg, openTigerBeetle); err != nil {
 		log.Printf("error: %v", err)
 		return 1
 	}
