@@ -340,12 +340,14 @@ func TestRun_RecoversInOrderAcrossStreamLeaderChanges(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Before every fourth batch, ask the stream to elect a new leader, so the batch is published while
-	// the election is in progress and fails. The publisher must recover by itself, in process.
+	// Before every second batch, up to six times, ask the stream to elect a new leader, so the batch
+	// is published while the election is in progress and fails. The publisher must recover by itself,
+	// in process. An election can occasionally finish before the publish; six chances make it
+	// practically certain that at least one publish fails.
 	var batches, stepdowns atomic.Int32
 	source := newFakeSource(testEvents(1000, 10)...)
 	source.beforeBatch = func() {
-		if batches.Add(1)%4 != 0 {
+		if batches.Add(1)%2 != 0 || stepdowns.Load() >= 6 {
 			return
 		}
 		resp, err := conn.Request("$JS.API.STREAM.LEADER.STEPDOWN."+cfg.eventStream, nil, time.Second)
