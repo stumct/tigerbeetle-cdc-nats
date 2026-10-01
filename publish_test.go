@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -283,7 +284,7 @@ func TestRun_RecoversInOrderAcrossStreamLeaderChanges(t *testing.T) {
 	js := connectJetStream(t, url)
 	cfg := testConfig(t, url,
 		"--stream-replicas=3", "--kv-replicas=3", "--publish-async-max-pending=16",
-		"--event-count-max=25", "--publish-ack-timeout=2s")
+		"--event-count-max=50", "--publish-ack-timeout=2s")
 
 	conn, err := nats.Connect(url)
 	if err != nil {
@@ -291,29 +292,29 @@ func TestRun_RecoversInOrderAcrossStreamLeaderChanges(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// stepDown forces the stream to elect a new leader, retrying while an election is in progress.
-	stepDown := func() {
-		eventually(t, 10*time.Second, "a stream leader change", func() bool {
-			resp, err := conn.Request("$JS.API.STREAM.LEADER.STEPDOWN."+cfg.eventStream, nil, time.Second)
-			return err == nil && strings.Contains(string(resp.Data), `"success":true`)
-		})
+	// Before every fourth batch, ask the stream to elect a new leader, so the batch is published while
+	// the election is in progress and fails. The publisher must recover by itself, in process.
+	var batches, stepdowns atomic.Int32
+	source := newFakeSource(testEvents(1000, 10)...)
+	source.beforeBatch = func() {
+		if batches.Add(1)%4 != 0 {
+			return
+		}
+		resp, err := conn.Request("$JS.API.STREAM.LEADER.STEPDOWN."+cfg.eventStream, nil, time.Second)
+		if err == nil && strings.Contains(string(resp.Data), `"success":true`) {
+			stepdowns.Add(1)
+		}
 	}
 
-	// Release events in chunks and change the stream leader after each one, while the previous
-	// chunks are still being published. The publisher must recover by itself, in process.
-	source := newFakeSource()
 	_, result := startRun(t, cfg, source)
-	all := testEvents(1000, 10)
-	for chunk := range 10 {
-		source.add(all[chunk*100 : (chunk+1)*100]...)
-		time.Sleep(20 * time.Millisecond)
-		stepDown()
-	}
-
-	awaitStream(t, js, cfg.eventStream, timestampsOf(all))
+	awaitStream(t, js, cfg.eventStream, timestampsOf(source.events))
 	select {
 	case err := <-result:
 		t.Fatalf("run stopped during leader changes: %v", err)
 	default:
 	}
+	if n := stepdowns.Load(); n < 3 {
+		t.Fatalf("only %d stream leader changes happened while publishing; want at least 3", n)
+	}
+	t.Logf("published %d events across %d stream leader changes", len(source.events), stepdowns.Load())
 }

@@ -171,10 +171,14 @@ func buildEventMessage(cfg config, event types.ChangeEvent) (*nats.Msg, error) {
 	return msg, nil
 }
 
-// jsErrCodeDuplicateMessageInProcess is JetStream's error code for a message whose Nats-Msg-Id
-// matches one still being replicated, for example an earlier attempt whose acknowledgement timed out.
-// nats.go doesn't name it.
-const jsErrCodeDuplicateMessageInProcess nats.ErrorCode = 10158
+// JetStream error codes for transient conditions that nats.go doesn't name.
+const (
+	// jsErrCodeDuplicateMessageInProcess: the message's Nats-Msg-Id matches one still being replicated,
+	// for example an earlier attempt whose acknowledgement timed out.
+	jsErrCodeDuplicateMessageInProcess nats.ErrorCode = 10158
+	// jsErrCodeStreamOffline: no peer of the stream is available, for example during a rolling restart.
+	jsErrCodeStreamOffline nats.ErrorCode = 10118
+)
 
 // isTransient reports whether a publish or resume failure is one that resuming from the stream can
 // get past: a lost or late response, a leader election, a reconnect, or a sequence check failing
@@ -202,5 +206,7 @@ func isTransient(err error) bool {
 
 	// 503: JetStream is temporarily unavailable, for example while a stream elects a leader.
 	var apiErr *nats.APIError
-	return errors.As(err, &apiErr) && (apiErr.Code == 503 || apiErr.ErrorCode == jsErrCodeDuplicateMessageInProcess)
+	return errors.As(err, &apiErr) && (apiErr.Code == 503 ||
+		apiErr.ErrorCode == jsErrCodeDuplicateMessageInProcess ||
+		apiErr.ErrorCode == jsErrCodeStreamOffline)
 }

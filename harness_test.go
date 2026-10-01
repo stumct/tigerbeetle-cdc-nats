@@ -175,6 +175,8 @@ func testConfig(t *testing.T, natsURL string, extraArgs ...string) config {
 // answers, and closes blocked first.
 type fakeSource struct {
 	unreachable bool
+	// beforeBatch, if set, runs before GetChangeEvents returns a non-empty batch.
+	beforeBatch func()
 	blocked     chan struct{}
 	blockOnce   sync.Once
 
@@ -207,6 +209,9 @@ func (f *fakeSource) GetChangeEvents(filter types.ChangeEventsFilter) ([]types.C
 		if event.Timestamp >= filter.TimestampMin && len(batch) < int(filter.Limit) {
 			batch = append(batch, event)
 		}
+	}
+	if len(batch) > 0 && f.beforeBatch != nil {
+		f.beforeBatch()
 	}
 	return batch, nil
 }
