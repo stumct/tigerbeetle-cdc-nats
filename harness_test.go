@@ -51,15 +51,47 @@ func startJetStream(t *testing.T) string {
 func startJetStreamCluster(t *testing.T) string {
 	t.Helper()
 
-	routePorts := make([]int, 3)
+	// Route ports must be known up front. Another test can take a reserved port before a server binds
+	// it, so start the servers together right after reserving, and retry with new ports if one fails.
+	for attempt := 1; ; attempt++ {
+		servers, ok := tryStartJetStreamCluster(t)
+		if !ok {
+			if attempt == 3 {
+				t.Fatalf("JetStream cluster did not start after %d attempts", attempt)
+			}
+			continue
+		}
+
+		eventually(t, 30*time.Second, "the JetStream cluster to elect a leader with all peers", func() bool {
+			for _, s := range servers {
+				if s.JetStreamIsLeader() && len(s.JetStreamClusterPeers()) == 3 {
+					return true
+				}
+			}
+			return false
+		})
+
+		urls := make([]string, len(servers))
+		for i, s := range servers {
+			urls[i] = s.ClientURL()
+		}
+		return strings.Join(urls, ",")
+	}
+}
+
+// tryStartJetStreamCluster starts three clustered servers on freshly reserved route ports. It reports
+// false, after shutting them down, if any fails to start.
+func tryStartJetStreamCluster(t *testing.T) ([]*server.Server, bool) {
+	t.Helper()
+
 	routes := make([]*url.URL, 3)
-	for i := range routePorts {
-		routePorts[i] = freePort(t)
-		routes[i] = &url.URL{Scheme: "nats-route", Host: fmt.Sprintf("127.0.0.1:%d", routePorts[i])}
+	ports := make([]int, 3)
+	for i := range ports {
+		ports[i] = freePort(t)
+		routes[i] = &url.URL{Scheme: "nats-route", Host: fmt.Sprintf("127.0.0.1:%d", ports[i])}
 	}
 
 	servers := make([]*server.Server, 3)
-	urls := make([]string, 3)
 	for i := range servers {
 		s, err := server.NewServer(&server.Options{
 			ServerName: fmt.Sprintf("n%d", i+1),
@@ -67,7 +99,7 @@ func startJetStreamCluster(t *testing.T) string {
 			Port:       server.RANDOM_PORT,
 			JetStream:  true,
 			StoreDir:   t.TempDir(),
-			Cluster:    server.ClusterOpts{Name: "test", Host: "127.0.0.1", Port: routePorts[i]},
+			Cluster:    server.ClusterOpts{Name: "test", Host: "127.0.0.1", Port: ports[i]},
 			Routes:     routes,
 			NoLog:      true,
 			NoSigs:     true,
@@ -75,26 +107,24 @@ func startJetStreamCluster(t *testing.T) string {
 		if err != nil {
 			t.Fatalf("server.NewServer(): %v", err)
 		}
+		servers[i] = s
 		go s.Start()
-		if !s.ReadyForConnections(10 * time.Second) {
-			t.Fatalf("NATS server %d did not start", i+1)
-		}
-		t.Cleanup(func() {
-			s.Shutdown()
-			s.WaitForShutdown()
-		})
-		servers[i], urls[i] = s, s.ClientURL()
 	}
 
-	eventually(t, 30*time.Second, "the JetStream cluster to elect a leader with all peers", func() bool {
+	stop := func() {
 		for _, s := range servers {
-			if s.JetStreamIsLeader() && len(s.JetStreamClusterPeers()) == 3 {
-				return true
-			}
+			s.Shutdown()
+			s.WaitForShutdown()
 		}
-		return false
-	})
-	return strings.Join(urls, ",")
+	}
+	for _, s := range servers {
+		if !s.ReadyForConnections(10 * time.Second) {
+			stop()
+			return nil, false
+		}
+	}
+	t.Cleanup(stop)
+	return servers, true
 }
 
 // freePort returns a TCP port that was free a moment ago.
