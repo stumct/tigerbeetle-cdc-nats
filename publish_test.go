@@ -19,7 +19,7 @@ func runUntilPublished(t *testing.T, js nats.JetStreamContext, cfg config, sourc
 	t.Helper()
 
 	cancel, result := startRun(t, cfg, source)
-	awaitStream(t, js, cfg.eventStream, want)
+	awaitStreamWhileRunning(t, js, cfg.eventStream, want, result)
 	eventually(t, 10*time.Second, "the checkpoint to record the last event", func() bool {
 		progress, found, err := readProgress(js, cfg)
 		return err == nil && found && progress.Timestamp == want[len(want)-1]
@@ -315,7 +315,8 @@ func TestRun_RefusesToResumeAfterTheLastEventWasDeleted(t *testing.T) {
 }
 
 func TestRun_PublishesInOrderOnReplicatedStream(t *testing.T) {
-	t.Parallel()
+	// Not parallel: each runs a 3-node cluster, and two at once alongside the parallel tests
+	// overloaded a 2-CPU CI runner until one run stalled.
 	url := startJetStreamCluster(t)
 	js := connectJetStream(t, url)
 	cfg := testConfig(t, url, "--stream-replicas=3", "--kv-replicas=3", "--publish-async-max-pending=64", "--event-count-max=250")
@@ -325,7 +326,8 @@ func TestRun_PublishesInOrderOnReplicatedStream(t *testing.T) {
 }
 
 func TestRun_RecoversInOrderAcrossStreamLeaderChanges(t *testing.T) {
-	t.Parallel()
+	// Not parallel: each runs a 3-node cluster, and two at once alongside the parallel tests
+	// overloaded a 2-CPU CI runner until one run stalled.
 	url := startJetStreamCluster(t)
 	js := connectJetStream(t, url)
 	cfg := testConfig(t, url,
@@ -353,7 +355,7 @@ func TestRun_RecoversInOrderAcrossStreamLeaderChanges(t *testing.T) {
 	}
 
 	_, result := startRun(t, cfg, source)
-	awaitStream(t, js, cfg.eventStream, timestampsOf(source.events))
+	awaitStreamWhileRunning(t, js, cfg.eventStream, timestampsOf(source.events), result)
 	select {
 	case err := <-result:
 		t.Fatalf("run stopped during leader changes: %v", err)
