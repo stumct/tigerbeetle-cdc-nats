@@ -53,9 +53,11 @@ func (m *metrics) recordStored(sequence uint64, timestamp uint64) {
 }
 
 // recordResume records where publishing resumes. The first resume sets the baseline; later ones count
-// events stored since the last acknowledgement, such as one whose acknowledgement was lost.
+// events stored since the last acknowledgement, such as one whose acknowledgement was lost. If NATS
+// lost acknowledged events, the stream resumes at an earlier sequence; the baseline moves back so the
+// events published again are counted.
 func (m *metrics) recordResume(at position) {
-	if m.resumed.Swap(true) {
+	if m.resumed.Swap(true) && at.streamSeq >= m.countedSeq.Load() {
 		m.countThrough(at.streamSeq)
 	} else {
 		m.countedSeq.Store(at.streamSeq)

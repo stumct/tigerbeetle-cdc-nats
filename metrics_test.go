@@ -118,3 +118,19 @@ func TestMetrics_CountEventsWhoseAcksWereLostOnANewStream(t *testing.T) {
 		t.Fatalf("events published = %d, want 3", got)
 	}
 }
+
+func TestMetrics_CountEventsPublishedAgainAfterNATSLostSome(t *testing.T) {
+	t.Parallel()
+
+	m := newMetrics("test")
+	m.recordResume(position{streamSeq: 100})
+	// NATS lost acknowledged events 91-100; publishing resumes at sequence 90 and stores them again.
+	m.recordResume(position{streamSeq: 90})
+	for seq := uint64(91); seq <= 100; seq++ {
+		m.recordStored(seq, seq*10)
+	}
+
+	if got := m.eventsPublished.Load(); got != 10 {
+		t.Fatalf("events published = %d, want 10", got)
+	}
+}
