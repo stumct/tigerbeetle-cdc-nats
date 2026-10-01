@@ -185,7 +185,7 @@ const (
 // because a message landed unexpectedly. Anything else, such as an encoding error, a sealed stream or
 // a message over the stream's size limit, needs an operator, so the run stops instead of retrying.
 func isTransient(err error) bool {
-	if isWrongLastSequence(err) || errors.Is(err, errUnexpectedAck) {
+	if isWrongLastSequence(err) || errors.Is(err, errUnexpectedAck) || errors.Is(err, errTailMoving) {
 		return true
 	}
 
@@ -205,8 +205,9 @@ func isTransient(err error) bool {
 	}
 
 	// 503: JetStream is temporarily unavailable, for example while a stream elects a leader.
+	// 429: the stream's inbound queue is full.
 	var apiErr *nats.APIError
-	return errors.As(err, &apiErr) && (apiErr.Code == 503 ||
+	return errors.As(err, &apiErr) && (apiErr.Code == 503 || apiErr.Code == 429 ||
 		apiErr.ErrorCode == jsErrCodeDuplicateMessageInProcess ||
 		apiErr.ErrorCode == jsErrCodeStreamOffline)
 }

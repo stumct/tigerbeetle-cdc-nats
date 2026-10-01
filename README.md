@@ -66,6 +66,7 @@ The event stream is an ordered copy of the cluster's change events:
 Requirements:
 
 - One stream per TigerBeetle cluster, with the publisher as its only writer. A foreign message that lands while a batch is in flight can take the position the next event expects and let it through, skipping the event before it. Enforce this with NATS permissions: allow only the publisher's user to publish to the stream's subjects (for example `tigerbeetle.cdc.<cluster>.>`). The publisher also refuses to resume if the stream's last message isn't one of its events.
+- nats-server 2.14 or newer for replicated streams in `async` mode. Older servers ignore a failed write while applying a replicated message, so a pipelined message could be stored in its place. On older servers the publisher logs a warning and publishes one message at a time.
 - Durable JetStream storage. NATS acknowledges a write before flushing it to disk, so on a single server a crash or power cut can lose acknowledged events. The publisher republishes them, but consumers may already have seen them. For financial data, use `--stream-replicas=3` on a NATS cluster, or `sync_interval: always` on a single server.
 - If the stream is deleted and recreated, the publisher refuses to resume into it, because earlier events would be missing. Start it with `--timestamp-last=0` to republish everything, or a later timestamp to start there.
 
@@ -176,7 +177,7 @@ TigerBeetle source:
 - `--event-count-max`: max events per `GetChangeEvents` request
 - `--idle-interval-ms`: poll interval while idle
 - `--requests-per-second-limit`: throttle only `GetChangeEvents` requests
-- `--timestamp-last`: publish only events after this timestamp. In a stream that holds events it only moves the start forward, never back, so it's safe to leave set. In a stream without events (new, recreated, or emptied by retention) it decides where publishing starts.
+- `--timestamp-last`: publish only events after this timestamp, when the stream has no position to continue from: it's new or recreated, or retention emptied it and the checkpoint doesn't match. Otherwise it's ignored, so it's safe to leave set. To skip ahead in an existing stream, start a new stream.
 
 NATS connection:
 

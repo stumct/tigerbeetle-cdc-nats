@@ -43,6 +43,17 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 	}
 	defer nc.Close()
 
+	// Before 2.14, nats-server ignores a failed write while applying a message to a replicated stream,
+	// so a message pipelined behind it can be stored in its place and leave a gap. Publish one message
+	// at a time there.
+	if cfg.publishMode == publishModeAsync && cfg.streamReplicas > 1 && !serverAtLeast(nc.ConnectedServerVersion(), 2, 14) {
+		log.Printf(
+			"warning: nats-server %s is older than 2.14, so replicated streams are published with --publish-mode=sync",
+			nc.ConnectedServerVersion(),
+		)
+		cfg.publishMode = publishModeSync
+	}
+
 	js, err := nc.JetStream(
 		// The publisher bounds its own outstanding messages, so the client's limit is never the one hit.
 		nats.PublishAsyncMaxPending(cfg.maxInFlight()),
@@ -224,6 +235,15 @@ func replicate(
 		}
 		log.Printf("published events=%d last_timestamp=%d stream_seq=%d", len(events), lastTimestamp, publisher.lastSeq)
 	}
+}
+
+// serverAtLeast reports whether a nats-server version such as "2.12.15" is at least major.minor.
+func serverAtLeast(version string, major, minor int) bool {
+	var gotMajor, gotMinor int
+	if _, err := fmt.Sscanf(version, "%d.%d", &gotMajor, &gotMinor); err != nil {
+		return false
+	}
+	return gotMajor > major || (gotMajor == major && gotMinor >= minor)
 }
 
 func nextQueryTimestamp(lastTimestamp uint64) (uint64, error) {

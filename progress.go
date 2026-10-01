@@ -15,8 +15,17 @@ import (
 // corrupt the stream. Retrying won't help: an operator has to decide.
 var errCannotResume = errors.New("cannot resume publishing")
 
-// errTailMissing reports that the message at the stream's last sequence no longer exists.
-var errTailMissing = errors.New("the stream's last message no longer exists")
+var (
+	// errTailMissing reports that the message at the stream's last sequence no longer exists.
+	errTailMissing = errors.New("the stream's last message no longer exists")
+	// errTailMoving reports that the stream's last message kept disappearing as it was read, because
+	// messages were appended while retention removed old ones. Retrying later will settle.
+	errTailMoving = errors.New("the stream's last message kept changing while it was read")
+)
+
+// maxTailReads bounds how many times readTail reads the stream state while its last message keeps
+// disappearing.
+const maxTailReads = 5
 
 // progressRecord is the checkpoint stored in the progress KV bucket after each published batch:
 // the last published event's timestamp, and the stream sequence it was stored at.
@@ -38,14 +47,15 @@ type position struct {
 //
 // The event stream is the record of what was published: publishing continues after the stream's
 // last event, the message at its last sequence. That holds even if the previous run crashed before
-// checkpointing, or a checkpoint outlived events NATS lost.
+// checkpointing, or a checkpoint outlived events NATS lost. If retention has removed every event,
+// the progress checkpoint is used, but only if it was written for the stream's last sequence.
 //
-// If retention has removed every event, the progress checkpoint is used, but only if it was
-// written for the stream's last sequence. Otherwise it can't say which events followed it.
-//
-// --timestamp-last starts publishing after the given timestamp. In a stream that holds events it
-// only moves the start forward, because going back would duplicate and reorder events. In a stream
-// without events it is the operator's choice, and wins over the checkpoint.
+// Either way, the stream's sequences map to TigerBeetle events in order, with none skipped, and every
+// copy of the publisher resumes on that same mapping. publisher relies on this. So --timestamp-last
+// applies only when there is no verified position to continue from: a new or recreated stream, or an
+// emptied one whose checkpoint doesn't match. Skipping ahead in a stream that already has a position
+// would change the mapping under messages an earlier instance may still have in flight, so it needs
+// a new stream. This also makes the flag safe to leave set.
 func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
 	lastSeq, timestamp, hasEvents, err := readTail(js, cfg)
 	if err != nil {
@@ -54,25 +64,34 @@ func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
 	override := cfg.timestampLast
 
 	if hasEvents {
-		switch {
-		case override != nil && *override > timestamp:
-			log.Printf("starting after --timestamp-last=%d, past the stream's last event (timestamp %d)", *override, timestamp)
-			return position{timestamp: *override, streamSeq: lastSeq}, nil
-		case override != nil:
-			log.Printf("ignoring --timestamp-last=%d: the stream already holds events up to timestamp %d", *override, timestamp)
+		if override != nil {
+			log.Printf("ignoring --timestamp-last=%d: stream %q already holds events", *override, cfg.eventStream)
 		}
 		log.Printf("resuming after the stream's last event: timestamp=%d stream_seq=%d", timestamp, lastSeq)
 		return position{timestamp: timestamp, streamSeq: lastSeq}, nil
 	}
 
-	if override != nil {
-		log.Printf("stream %q holds no events; starting after --timestamp-last=%d", cfg.eventStream, *override)
-		return position{timestamp: *override, streamSeq: lastSeq}, nil
-	}
-
 	progress, found, err := readProgress(js, cfg)
 	if err != nil {
 		return position{}, err
+	}
+
+	if lastSeq > 0 && found && progress.StreamSeq == lastSeq {
+		if override != nil {
+			log.Printf("ignoring --timestamp-last=%d: stream %q has a checkpoint for its last sequence", *override, cfg.eventStream)
+		}
+		log.Printf(
+			"stream %q holds no events (retention removed them); resuming after its checkpoint: timestamp=%d stream_seq=%d",
+			cfg.eventStream,
+			progress.Timestamp,
+			lastSeq,
+		)
+		return position{timestamp: progress.Timestamp, streamSeq: lastSeq}, nil
+	}
+
+	if override != nil {
+		log.Printf("stream %q has no position to continue from; starting after --timestamp-last=%d", cfg.eventStream, *override)
+		return position{timestamp: *override, streamSeq: lastSeq}, nil
 	}
 
 	switch {
@@ -91,7 +110,7 @@ func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
 			progress.Timestamp,
 		)
 
-	case !found || progress.StreamSeq != lastSeq:
+	default:
 		return position{}, fmt.Errorf(
 			"%w: stream %q holds no events (retention removed them) and ends at sequence %d, but %q has no "+
 				"checkpoint for that sequence, so the events that followed it are unknown. Set --timestamp-last "+
@@ -101,22 +120,14 @@ func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
 			lastSeq,
 			cfg.progressBucket,
 		)
-
-	default:
-		log.Printf(
-			"stream %q holds no events (retention removed them); resuming after its checkpoint: timestamp=%d stream_seq=%d",
-			cfg.eventStream,
-			progress.Timestamp,
-			lastSeq,
-		)
-		return position{timestamp: progress.Timestamp, streamSeq: lastSeq}, nil
 	}
 }
 
 // readTail returns the stream's last sequence and, if the stream holds events, the timestamp of the
 // event at that sequence.
 func readTail(js nats.JetStreamContext, cfg config) (lastSeq uint64, timestamp uint64, hasEvents bool, err error) {
-	for attempt := 0; ; attempt++ {
+	var previousLastSeq uint64
+	for attempt := range maxTailReads {
 		info, err := js.StreamInfo(cfg.eventStream)
 		if err != nil {
 			return 0, 0, false, fmt.Errorf("read stream %q state: %w", cfg.eventStream, err)
@@ -131,10 +142,11 @@ func readTail(js nats.JetStreamContext, cfg config) (lastSeq uint64, timestamp u
 			return lastSeq, timestamp, err == nil, err
 		}
 
-		// Retention may have removed the last event since StreamInfo, so read the state again. If
-		// events remain but the last one is still missing, it was deleted, and only an operator can
-		// tell which events consumers still need.
-		if attempt > 0 {
+		// The last message vanished after StreamInfo. Retention removes the oldest messages first, so
+		// if it removed this one, the stream is now empty or has grown. If neither happened, it was
+		// deleted while earlier events remain, and only an operator can tell which events consumers
+		// still need.
+		if attempt > 0 && lastSeq == previousLastSeq {
 			return 0, 0, false, fmt.Errorf(
 				"%w: the message at stream %q's last sequence %d was deleted while earlier events remain, so the "+
 					"publisher can't tell where to resume; restore it, or purge the stream and set --timestamp-last",
@@ -143,7 +155,9 @@ func readTail(js nats.JetStreamContext, cfg config) (lastSeq uint64, timestamp u
 				lastSeq,
 			)
 		}
+		previousLastSeq = lastSeq
 	}
+	return 0, 0, false, fmt.Errorf("%w: stream %q", errTailMoving, cfg.eventStream)
 }
 
 // lastEventTimestamp returns the TigerBeetle timestamp of the event at the stream's last sequence,

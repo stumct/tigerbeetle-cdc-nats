@@ -184,10 +184,19 @@ type fakeSource struct {
 	events    []types.ChangeEvent
 	closed    chan struct{}
 	closeOnce sync.Once
+	// served counts queries per TimestampMin that returned events; refetches counts repeats of those,
+	// which happen only when publishing resumes after a failure.
+	served    map[uint64]bool
+	refetches int
 }
 
 func newFakeSource(events ...types.ChangeEvent) *fakeSource {
-	return &fakeSource{events: events, blocked: make(chan struct{}), closed: make(chan struct{})}
+	return &fakeSource{
+		events:  events,
+		blocked: make(chan struct{}),
+		closed:  make(chan struct{}),
+		served:  map[uint64]bool{},
+	}
 }
 
 func (f *fakeSource) GetChangeEvents(filter types.ChangeEventsFilter) ([]types.ChangeEvent, error) {
@@ -210,10 +219,23 @@ func (f *fakeSource) GetChangeEvents(filter types.ChangeEventsFilter) ([]types.C
 			batch = append(batch, event)
 		}
 	}
-	if len(batch) > 0 && f.beforeBatch != nil {
-		f.beforeBatch()
+	if len(batch) > 0 {
+		if f.served[filter.TimestampMin] {
+			f.refetches++
+		}
+		f.served[filter.TimestampMin] = true
+		if f.beforeBatch != nil {
+			f.beforeBatch()
+		}
 	}
 	return batch, nil
+}
+
+// refetchCount returns how many times a batch was fetched again after publishing it failed.
+func (f *fakeSource) refetchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.refetches
 }
 
 // add makes more events available, as if they were just committed.

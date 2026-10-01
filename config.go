@@ -239,7 +239,7 @@ func parseConfig(args []string, version string) (config, error) {
 	fs.Uint("progress-every-events", 0, "Deprecated: has no effect")
 	fs.UintVar(&idleIntervalMS, "idle-interval-ms", uint(defaultIdleInterval/time.Millisecond), "Polling interval when no events are available")
 	fs.Var(&requestsPerSecondLimit, "requests-per-second-limit", "Rate-limit for get_change_events requests")
-	fs.Var(&timestampLast, "timestamp-last", "Publish only events after this timestamp; ignored once the stream is past it")
+	fs.Var(&timestampLast, "timestamp-last", "Publish only events after this timestamp, when the stream has no position to continue from")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err

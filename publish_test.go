@@ -3,6 +3,7 @@ package cdcnats
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -152,7 +153,7 @@ func TestRun_RefusesStaleCheckpointWhenRetentionEmptiedStream(t *testing.T) {
 	runUntilPublished(t, js, override, newFakeSource(append(all, testEvent(40))...), []uint64{40})
 }
 
-func TestRun_TimestampLastOnlyMovesForwardInAStreamWithEvents(t *testing.T) {
+func TestRun_TimestampLastAppliesOnlyWithoutAPosition(t *testing.T) {
 	t.Parallel()
 	url := startJetStream(t)
 	js := connectJetStream(t, url)
@@ -167,11 +168,16 @@ func TestRun_TimestampLastOnlyMovesForwardInAStreamWithEvents(t *testing.T) {
 	// A new stream starts after the given timestamp.
 	runUntilPublished(t, js, testConfig(t, url, "--timestamp-last=20"), source(10, 20, 30, 40), []uint64{30, 40})
 
-	// Restarting with the flag still set resumes from the stream, not from the flag.
-	runUntilPublished(t, js, testConfig(t, url, "--timestamp-last=20"), source(10, 20, 30, 40, 50), []uint64{30, 40, 50})
+	// Once the stream holds events, the flag is ignored: skipping ahead would change which event
+	// belongs at each stream position under messages an earlier instance may still have in flight.
+	runUntilPublished(t, js, testConfig(t, url, "--timestamp-last=60"), source(10, 20, 30, 40, 50, 70), []uint64{30, 40, 50, 70})
 
-	// A later timestamp skips ahead.
-	runUntilPublished(t, js, testConfig(t, url, "--timestamp-last=70"), source(10, 20, 30, 40, 50, 60, 80), []uint64{30, 40, 50, 80})
+	// After retention empties the stream, a leftover flag doesn't republish history either: the
+	// checkpoint matches the stream's last sequence, so publishing continues from it.
+	if err := js.PurgeStream(testConfig(t, url).eventStream); err != nil {
+		t.Fatalf("PurgeStream(): %v", err)
+	}
+	runUntilPublished(t, js, testConfig(t, url, "--timestamp-last=0"), source(10, 20, 30, 40, 50, 70, 80), []uint64{80})
 }
 
 func TestRun_StopsWhenAnotherWriterAppendsToStream(t *testing.T) {
@@ -316,5 +322,49 @@ func TestRun_RecoversInOrderAcrossStreamLeaderChanges(t *testing.T) {
 	if n := stepdowns.Load(); n < 3 {
 		t.Fatalf("only %d stream leader changes happened while publishing; want at least 3", n)
 	}
-	t.Logf("published %d events across %d stream leader changes", len(source.events), stepdowns.Load())
+	// A batch is fetched again only when publishing it failed and the publisher resumed.
+	if n := source.refetchCount(); n == 0 {
+		t.Fatalf("no publish failed during %d leader changes, so recovery wasn't exercised", stepdowns.Load())
+	}
+	t.Logf("published %d events across %d stream leader changes and %d recoveries",
+		len(source.events), stepdowns.Load(), source.refetchCount())
+}
+
+func TestIsTransient(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"wrong last sequence", &nats.APIError{Code: 400, ErrorCode: nats.JSErrCodeStreamWrongLastSequence}, true},
+		{"temporarily unavailable", &nats.APIError{Code: 503, ErrorCode: 10008}, true},
+		{"inbound queue full", &nats.APIError{Code: 429, ErrorCode: 10167}, true},
+		{"duplicate in process", &nats.APIError{Code: 409, ErrorCode: 10158}, true},
+		{"stream offline", &nats.APIError{Code: 500, ErrorCode: 10118}, true},
+		{"ack timeout", nats.ErrAsyncPublishTimeout, true},
+		{"no responders", nats.ErrNoResponders, true},
+		{"reconnecting", nats.ErrReconnectBufExceeded, true},
+		{"message too large", &nats.APIError{Code: 400, ErrorCode: 10054}, false},
+		{"stream sealed", &nats.APIError{Code: 400, ErrorCode: 10109}, false},
+		{"connection closed", nats.ErrConnectionClosed, false},
+		{"cannot resume", errCannotResume, false},
+	} {
+		if got := isTransient(fmt.Errorf("wrapped: %w", tc.err)); got != tc.want {
+			t.Errorf("isTransient(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestServerAtLeast(t *testing.T) {
+	t.Parallel()
+
+	for version, want := range map[string]bool{
+		"2.12.15": false, "2.13.0": false, "2.14.0": true, "2.15.0": true, "3.0.0": true, "": false, "dev": false,
+	} {
+		if got := serverAtLeast(version, 2, 14); got != want {
+			t.Errorf("serverAtLeast(%q, 2, 14) = %v, want %v", version, got, want)
+		}
+	}
 }
