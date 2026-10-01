@@ -62,14 +62,15 @@ func TestMetrics_EscapesLabelValues(t *testing.T) {
 	}
 }
 
-func TestRun_MetricsReportTheStoredEventAfterTimestampOverride(t *testing.T) {
+func TestRun_MetricsReportTheStoredEventNotTheTimestampFlag(t *testing.T) {
 	t.Parallel()
 	url := startJetStream(t)
 	js := connectJetStream(t, url)
 	cfg := testConfig(t, url)
 	runUntilPublished(t, js, cfg, newFakeSource(testEvent(1_000_000_000)), []uint64{1_000_000_000})
 
-	// Skipping ahead stores nothing new, so the last event is still the one at 1s, not the override.
+	// The flag is ignored for a stream that holds events, and the metric reports the stored event, not
+	// the flag's timestamp.
 	addr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
 	startRun(t, testConfig(t, url, "--timestamp-last=5000000000", "--metrics-addr="+addr), newFakeSource())
 
@@ -84,4 +85,36 @@ func TestRun_MetricsReportTheStoredEventAfterTimestampOverride(t *testing.T) {
 			strings.Contains(string(body), "tb_cdc_last_event_timestamp_seconds 1.000\n") &&
 			strings.Contains(string(body), "tb_cdc_caught_up 1\n")
 	})
+}
+
+func TestMetrics_CountEventsByStreamSequence(t *testing.T) {
+	t.Parallel()
+
+	m := newMetrics("test")
+	m.recordResume(position{streamSeq: 10}) // events stored before this process started aren't counted
+	m.recordStored(11, 110)
+	m.recordStored(12, 120)
+	// The acknowledgement for sequence 13 was lost; resuming finds the stream at 14.
+	m.recordResume(position{streamSeq: 14, storedTimestamp: 140})
+	m.recordStored(14, 140) // a late acknowledgement for an already counted event
+
+	if got := m.eventsPublished.Load(); got != 4 {
+		t.Fatalf("events published = %d, want 4", got)
+	}
+	if got := m.lastEventTimestamp.Load(); got != 140 {
+		t.Fatalf("last event timestamp = %d, want 140", got)
+	}
+}
+
+func TestMetrics_CountEventsWhoseAcksWereLostOnANewStream(t *testing.T) {
+	t.Parallel()
+
+	m := newMetrics("test")
+	m.recordResume(position{streamSeq: 0})
+	// Every acknowledgement of the first batch was lost; resuming finds 3 events stored.
+	m.recordResume(position{streamSeq: 3, storedTimestamp: 30})
+
+	if got := m.eventsPublished.Load(); got != 3 {
+		t.Fatalf("events published = %d, want 3", got)
+	}
 }

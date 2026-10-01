@@ -21,6 +21,11 @@ type metrics struct {
 
 	lockHeld        atomic.Bool
 	eventsPublished atomic.Uint64
+	// countedSeq is the stream sequence up to which events are counted in eventsPublished, set from
+	// the first resume (resumed). The publisher is the stream's only writer, so the sequence advancing
+	// by n means n events were stored, including ones whose acknowledgement was lost.
+	countedSeq      atomic.Uint64
+	resumed         atomic.Bool
 	publishFailures atomic.Uint64
 	// lastEventTimestamp is the TigerBeetle timestamp (nanoseconds) of the last published event.
 	lastEventTimestamp atomic.Uint64
@@ -41,10 +46,32 @@ func (m *metrics) recordPoll(n int) {
 	m.caughtUp.Store(n == 0)
 }
 
-// recordStored records an event JetStream confirmed it stored.
-func (m *metrics) recordStored(timestamp uint64) {
-	m.eventsPublished.Add(1)
+// recordStored records an event JetStream confirmed it stored at sequence.
+func (m *metrics) recordStored(sequence uint64, timestamp uint64) {
+	m.countThrough(sequence)
 	m.lastEventTimestamp.Store(timestamp)
+}
+
+// recordResume records where publishing resumes. The first resume sets the baseline; later ones count
+// events stored since the last acknowledgement, such as one whose acknowledgement was lost.
+func (m *metrics) recordResume(at position) {
+	if m.resumed.Swap(true) {
+		m.countThrough(at.streamSeq)
+	} else {
+		m.countedSeq.Store(at.streamSeq)
+	}
+	if at.storedTimestamp > 0 {
+		m.lastEventTimestamp.Store(at.storedTimestamp)
+	}
+}
+
+// countThrough counts the events stored up to sequence that aren't counted yet. Only the replication
+// goroutine calls it.
+func (m *metrics) countThrough(sequence uint64) {
+	if counted := m.countedSeq.Load(); sequence > counted {
+		m.eventsPublished.Add(sequence - counted)
+		m.countedSeq.Store(sequence)
+	}
 }
 
 // ServeHTTP writes the metrics in the Prometheus text exposition format.

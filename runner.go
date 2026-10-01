@@ -200,9 +200,7 @@ func replicate(
 			lastTimestamp, streamCreated = resumeAt.timestamp, resumeAt.streamCreated
 			publisher = newPublisher(js, cfg, resumeAt.streamSeq, window)
 			publisher.onStored = stats.recordStored
-			if resumeAt.storedTimestamp > 0 {
-				stats.lastEventTimestamp.Store(resumeAt.storedTimestamp)
-			}
+			stats.recordResume(resumeAt)
 		}
 
 		if err := rateLimiter.wait(ctx); err != nil {

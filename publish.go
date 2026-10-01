@@ -34,9 +34,9 @@ type publisher struct {
 	lastSeq uint64
 	// maxInFlight is how many published messages may await acknowledgement at once.
 	maxInFlight int
-	// onStored, if set, is called with each event's timestamp once JetStream confirms it is stored,
-	// including events stored before a later one in the same batch fails.
-	onStored func(timestamp uint64)
+	// onStored, if set, is called with each event's stream sequence and timestamp once JetStream
+	// confirms it is stored, including events stored before a later one in the same batch fails.
+	onStored func(sequence uint64, timestamp uint64)
 }
 
 func newPublisher(js nats.JetStreamContext, cfg config, lastSeq uint64, maxInFlight int) *publisher {
@@ -137,7 +137,7 @@ func (p *publisher) await(ctx context.Context, pending pendingEvent) error {
 
 	p.lastSeq = ack.Sequence
 	if p.onStored != nil {
-		p.onStored(pending.timestamp)
+		p.onStored(ack.Sequence, pending.timestamp)
 	}
 	return nil
 }
@@ -150,7 +150,7 @@ func (p *publisher) settle(ctx context.Context, outstanding []pendingEvent, err 
 		select {
 		case ack := <-pending.future.Ok():
 			if ack != nil && ack.Stream == p.cfg.eventStream && !ack.Duplicate && p.onStored != nil {
-				p.onStored(pending.timestamp)
+				p.onStored(ack.Sequence, pending.timestamp)
 			}
 		case <-pending.future.Err():
 		case <-ctx.Done():
