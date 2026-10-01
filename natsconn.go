@@ -15,6 +15,10 @@ import (
 func connectNATS(cfg config) (*nats.Conn, error) {
 	options := []nats.Option{
 		nats.Name("tb-cdc-nats"),
+		// Fail publishes while reconnecting instead of buffering them. A buffered event would be sent
+		// whenever the connection returns, possibly after another instance has taken over; failing
+		// fast lets the publisher back off and resume from the stream.
+		nats.ReconnectBufSize(-1),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			if err != nil {
 				log.Printf("warning: disconnected from NATS: %v", err)

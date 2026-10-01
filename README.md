@@ -6,9 +6,9 @@ It mirrors `tigerbeetle amqp` semantics while taking advantage of JetStream:
 
 - Polls TigerBeetle `GetChangeEvents` with `timestamp_min = last_timestamp + 1`
 - Publishes JSON events with portable-number encoding compatibility
-- Waits for JetStream publish acknowledgements before writing progress
-- Stores progress and lock state in JetStream KV (stateless runner)
-- Uses deterministic `Nats-Msg-Id` (`<cluster>/<timestamp>`) for de-duplication
+- Appends each event only directly after the one before it, so the stream has no gaps, duplicates or reordering
+- Resumes from the last event in the stream; keeps a fallback checkpoint and the single-writer lock in JetStream KV (stateless runner)
+- Sets a deterministic `Nats-Msg-Id` (`<cluster>/<timestamp>`) on every event
 
 ## Getting started in 5 minutes
 
@@ -54,11 +54,21 @@ nats --server nats://127.0.0.1:4222 sub 'tigerbeetle.cdc.>'
 
 ## Delivery semantics
 
-- Delivery is **at-least-once**.
-- Progress advances only after event publish acknowledgements complete.
-- If the process crashes after event ack but before progress write, events can be replayed.
-- JetStream can suppress replay duplicates inside `--dedupe-window` due to deterministic `Nats-Msg-Id`.
-- Consumers should still be idempotent using `<cluster>/<timestamp>` as a stable event key.
+The event stream is an ordered copy of the cluster's change events:
+
+- Events appear in TigerBeetle timestamp order, each at most once, with no gaps.
+- Every message carries `Nats-Expected-Last-Sequence`, the stream sequence of the event before it, and publishing always starts from a position read back from the stream. JetStream stores a message only if the stream ends at that sequence. So a lost or rejected message, a stream leader change mid-batch, a late message from an earlier attempt, or a second instance of the publisher cannot leave a gap or reorder events.
+- After a failure, and on every start, publishing resumes after the message at the stream's last sequence, read from the stream leader. Crashing between publishing and checkpointing therefore doesn't republish anything, however long the restart takes.
+- Lost responses, leader elections, reconnects and rejected messages are retried in-process with backoff. Failures that need an operator, such as a message over the stream's size limit or a sealed stream, stop the publisher.
+- The KV progress checkpoint records the last event's timestamp and stream sequence, and when the stream was created. It is a fallback, used only when retention has removed every event from the stream, and only if it matches that stream's last sequence and creation time. Otherwise the publisher stops and asks for `--timestamp-last`.
+- Consumers get at-least-once delivery from their JetStream consumer. Use `Nats-Msg-Id` (`<cluster>/<timestamp>`) or the stream sequence as the idempotency key.
+
+Requirements:
+
+- One stream per TigerBeetle cluster, with the publisher as its only writer. A foreign message that lands while a batch is in flight can take the position the next event expects and let it through, skipping the event before it. Enforce this with NATS permissions: allow only the publisher's user to publish to the stream's subjects (for example `tigerbeetle.cdc.<cluster>.>`). The publisher also refuses to resume if the stream's last message isn't one of its events.
+- nats-server 2.14 or newer for replicated streams in `async` mode. Older servers ignore a failed write while applying a replicated message, so a pipelined message could be stored in its place. When connected to an older server, the publisher publishes one message at a time. It only sees the server it's connected to, so a cluster running mixed versions, for example mid-upgrade from 2.12, must use `--publish-mode=sync` until every server runs 2.14 or later.
+- Durable JetStream storage. NATS acknowledges a write before flushing it to disk, so on a single server a crash or power cut can lose acknowledged events. The publisher republishes them, but consumers may already have seen them. For financial data, use `--stream-replicas=3` on a NATS cluster, or `sync_interval: always` on a single server.
+- If the stream is deleted and recreated, the publisher refuses to resume into it, because earlier events would be missing. Start it with `--timestamp-last=0` to republish everything, or a later timestamp to start there.
 
 ## Default resource model (cluster-scoped)
 
@@ -167,7 +177,7 @@ TigerBeetle source:
 - `--event-count-max`: max events per `GetChangeEvents` request
 - `--idle-interval-ms`: poll interval while idle
 - `--requests-per-second-limit`: throttle only `GetChangeEvents` requests
-- `--timestamp-last`: override stored progress on startup
+- `--timestamp-last`: publish only events after this timestamp, when the stream has no position to continue from: it's new or recreated, or retention emptied it and the checkpoint doesn't match. Otherwise it's ignored, so it's safe to leave set. To skip ahead in an existing stream, start a new stream.
 
 NATS connection:
 
@@ -196,10 +206,10 @@ JetStream provisioning and retention:
 
 Publishing behavior:
 
-- `--publish-mode`: `async` (default) or `sync`
-- `--publish-async-max-pending`: max in-flight async publish requests
-- `--publish-ack-timeout`: publish acknowledgement timeout
-- `--progress-every-events`: checkpoint progress every N published events (`0` = once per fetched batch)
+- `--publish-mode`: `async` (default) pipelines up to `--publish-async-max-pending` unacknowledged messages; `sync` waits for each acknowledgement
+- `--publish-async-max-pending`: max unacknowledged messages in async mode
+- `--publish-ack-timeout`: time allowed for each message's acknowledgement. After a transient failure the publisher backs off (0.5s doubling to 30s) and resumes from the stream instead of exiting.
+- `--progress-every-events`: deprecated, has no effect
 
 Subject routing:
 
