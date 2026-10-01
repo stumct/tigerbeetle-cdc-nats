@@ -2,11 +2,9 @@ package cdcnats
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"strconv"
 	"sync"
 	"time"
 
@@ -14,17 +12,6 @@ import (
 	tigerbeetle_go "github.com/tigerbeetle/tigerbeetle-go"
 	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
 )
-
-type progressRecord struct {
-	Timestamp uint64 `json:"timestamp"`
-	Version   string `json:"version"`
-}
-
-type pendingPublish struct {
-	future    nats.PubAckFuture
-	timestamp uint64
-	subject   string
-}
 
 // changeEventSource is the part of the TigerBeetle client that the runner uses. Tests substitute a
 // fake.
@@ -56,22 +43,13 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 	}
 	defer nc.Close()
 
-	jsOptions := make([]nats.JSOpt, 0, 2)
-	if cfg.publishMode == publishModeAsync {
-		jsOptions = append(
-			jsOptions,
-			nats.PublishAsyncMaxPending(cfg.publishAsyncMaxPending),
-			nats.PublishAsyncErrHandler(func(_ nats.JetStream, msg *nats.Msg, err error) {
-				if msg == nil {
-					log.Printf("warning: async publish failed: %v", err)
-					return
-				}
-				log.Printf("warning: async publish failed subject=%q: %v", msg.Subject, err)
-			}),
-		)
-	}
-
-	js, err := nc.JetStream(jsOptions...)
+	js, err := nc.JetStream(
+		// The publisher bounds its own outstanding messages, so the client's limit is never the one hit.
+		nats.PublishAsyncMaxPending(cfg.maxInFlight()),
+		// Resolve every async publish within the timeout, even if its acknowledgement is lost, so no
+		// message stays pending after a failure (see publisher.publish).
+		nats.PublishAsyncTimeout(cfg.publishAckTimeout),
+	)
 	if err != nil {
 		return fmt.Errorf("create JetStream context: %w", err)
 	}
@@ -130,8 +108,19 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 	return err
 }
 
-// replicate recovers progress, then repeatedly fetches change events from TigerBeetle and publishes
-// them until ctx is done or an error occurs.
+const (
+	// minRetryDelay and maxRetryDelay bound the backoff between attempts to resume publishing after a
+	// NATS failure, such as a stream leader election.
+	minRetryDelay = 500 * time.Millisecond
+	maxRetryDelay = 30 * time.Second
+)
+
+// replicate repeatedly fetches change events from TigerBeetle and publishes them until ctx is done
+// or an error it can't recover from occurs.
+//
+// It resumes from the event stream (see recoverPosition). When a publish fails, for example during a
+// NATS leader election, it backs off and resumes from the stream again rather than exiting. That is
+// safe because the publisher only appends events that directly follow the stream's last one.
 func replicate(
 	ctx context.Context,
 	js nats.JetStreamContext,
@@ -139,11 +128,6 @@ func replicate(
 	cfg config,
 	openSource func(config) (changeEventSource, error),
 ) error {
-	lastTimestamp, err := recoverProgress(cfg, progressKV)
-	if err != nil {
-		return err
-	}
-
 	source, err := openSource(cfg)
 	if err != nil {
 		return fmt.Errorf("create TigerBeetle client: %w", err)
@@ -158,9 +142,41 @@ func replicate(
 
 	rateLimiter := newRequestRateLimiter(cfg.requestsPerSecondLimit)
 
+	var (
+		// publisher is nil until the position has been recovered from the stream, and again after a
+		// failure, so the next attempt resumes from whatever the stream now holds.
+		publisher     *publisher
+		lastTimestamp uint64
+		failures      int
+	)
+
+	// retryLater logs a recoverable failure and waits, backing off while failures repeat.
+	retryLater := func(err error) error {
+		failures++
+		delay := min(minRetryDelay<<min(failures-1, 16), maxRetryDelay)
+		log.Printf("warning: %v; resuming from the stream in %s", err, delay)
+		publisher = nil
+		return sleepContext(ctx, delay)
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+
+		if publisher == nil {
+			resumeAt, err := recoverPosition(js, cfg)
+			if errors.Is(err, errCannotResume) {
+				return err
+			}
+			if err != nil {
+				if err := retryLater(err); err != nil {
+					return err
+				}
+				continue
+			}
+			lastTimestamp = resumeAt.timestamp
+			publisher = newPublisher(js, cfg, resumeAt.streamSeq)
 		}
 
 		if err := rateLimiter.wait(ctx); err != nil {
@@ -188,233 +204,25 @@ func replicate(
 			continue
 		}
 
-		if err := publishEventsAndCheckpoint(ctx, js, progressKV, cfg, events, &lastTimestamp); err != nil {
-			return err
+		if err := publisher.publish(ctx, events); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			if err := retryLater(err); err != nil {
+				return err
+			}
+			continue
 		}
-	}
-}
+		failures = 0
+		lastTimestamp = events[len(events)-1].Timestamp
 
-func recoverProgress(cfg config, kv nats.KeyValue) (uint64, error) {
-	if cfg.timestampLast != nil {
-		log.Printf("using timestamp override --timestamp-last=%d", *cfg.timestampLast)
-		return *cfg.timestampLast, nil
-	}
-
-	entry, err := kv.Get(cfg.progressKey())
-	if err != nil {
-		if errors.Is(err, nats.ErrKeyNotFound) {
-			log.Printf("no prior progress found for %q, starting from beginning", cfg.progressKey())
-			return 0, nil
+		// The stream itself records progress. This checkpoint is only read if retention empties the
+		// stream, so a failure here doesn't risk losing or repeating events and need not stop publishing.
+		if err := writeProgress(progressKV, cfg, lastTimestamp); err != nil {
+			log.Printf("warning: %v", err)
 		}
-		return 0, fmt.Errorf("read progress from %q: %w", cfg.progressKey(), err)
+		log.Printf("published events=%d last_timestamp=%d stream_seq=%d", len(events), lastTimestamp, publisher.lastSeq)
 	}
-
-	var progress progressRecord
-	if err := json.Unmarshal(entry.Value(), &progress); err != nil {
-		return 0, fmt.Errorf("invalid progress payload in %q: %w", cfg.progressKey(), err)
-	}
-
-	log.Printf("recovered progress timestamp=%d version=%q", progress.Timestamp, progress.Version)
-	return progress.Timestamp, nil
-}
-
-func writeProgress(kv nats.KeyValue, key string, progress progressRecord) error {
-	payload, err := json.Marshal(progress)
-	if err != nil {
-		return fmt.Errorf("marshal progress: %w", err)
-	}
-
-	if _, err := kv.Put(key, payload); err != nil {
-		return fmt.Errorf("write progress key %q: %w", key, err)
-	}
-
-	return nil
-}
-
-func publishEventsAndCheckpoint(
-	ctx context.Context,
-	js nats.JetStreamContext,
-	progressKV nats.KeyValue,
-	cfg config,
-	events []types.ChangeEvent,
-	lastTimestamp *uint64,
-) error {
-	if len(events) == 0 {
-		return nil
-	}
-
-	chunkSize := len(events)
-	if cfg.progressEveryEvents > 0 && int(cfg.progressEveryEvents) < chunkSize {
-		chunkSize = int(cfg.progressEveryEvents)
-	}
-
-	for start := 0; start < len(events); start += chunkSize {
-		end := start + chunkSize
-		if end > len(events) {
-			end = len(events)
-		}
-
-		chunk := events[start:end]
-		if err := publishEventChunk(ctx, js, cfg, chunk); err != nil {
-			return err
-		}
-
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		chunkLastTimestamp := chunk[len(chunk)-1].Timestamp
-		if err := writeProgress(progressKV, cfg.progressKey(), progressRecord{
-			Timestamp: chunkLastTimestamp,
-			Version:   cfg.version,
-		}); err != nil {
-			return err
-		}
-
-		*lastTimestamp = chunkLastTimestamp
-	}
-
-	log.Printf("published events=%d last_timestamp=%d", len(events), *lastTimestamp)
-	return nil
-}
-
-func publishEventChunk(
-	ctx context.Context,
-	js nats.JetStreamContext,
-	cfg config,
-	events []types.ChangeEvent,
-) error {
-	switch cfg.publishMode {
-	case publishModeSync:
-		return publishEventChunkSync(ctx, js, cfg, events)
-	case publishModeAsync:
-		return publishEventChunkAsync(ctx, js, cfg, events)
-	default:
-		return fmt.Errorf("unsupported publish mode %q", cfg.publishMode)
-	}
-}
-
-func publishEventChunkSync(
-	ctx context.Context,
-	js nats.JetStreamContext,
-	cfg config,
-	events []types.ChangeEvent,
-) error {
-	for _, event := range events {
-		msg, err := buildEventMessage(cfg, event)
-		if err != nil {
-			return err
-		}
-
-		publishCtx, cancel := context.WithTimeout(ctx, cfg.publishAckTimeout)
-		ack, err := js.PublishMsg(msg, nats.Context(publishCtx))
-		cancel()
-		if err != nil {
-			return fmt.Errorf("publish event timestamp=%d subject=%q: %w", event.Timestamp, msg.Subject, err)
-		}
-		if ack != nil && ack.Duplicate {
-			log.Printf("duplicate publish acknowledged for timestamp=%d subject=%q", event.Timestamp, msg.Subject)
-		}
-	}
-
-	return nil
-}
-
-func publishEventChunkAsync(
-	ctx context.Context,
-	js nats.JetStreamContext,
-	cfg config,
-	events []types.ChangeEvent,
-) error {
-	pending := make([]pendingPublish, 0, len(events))
-
-	for _, event := range events {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		msg, err := buildEventMessage(cfg, event)
-		if err != nil {
-			return err
-		}
-
-		future, err := js.PublishMsgAsync(msg)
-		if err != nil {
-			return fmt.Errorf("queue async publish timestamp=%d subject=%q: %w", event.Timestamp, msg.Subject, err)
-		}
-
-		pending = append(pending, pendingPublish{
-			future:    future,
-			timestamp: event.Timestamp,
-			subject:   msg.Subject,
-		})
-	}
-
-	duplicateCount := 0
-	for _, p := range pending {
-		ack, err := waitForPublishAck(ctx, p.future, cfg.publishAckTimeout)
-		if err != nil {
-			return fmt.Errorf("await async publish ack timestamp=%d subject=%q: %w", p.timestamp, p.subject, err)
-		}
-		if ack.Duplicate {
-			duplicateCount++
-		}
-	}
-
-	if duplicateCount > 0 {
-		log.Printf("async publish completed with duplicates=%d", duplicateCount)
-	}
-
-	return nil
-}
-
-func waitForPublishAck(
-	ctx context.Context,
-	future nats.PubAckFuture,
-	timeout time.Duration,
-) (*nats.PubAck, error) {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case err := <-future.Err():
-		if err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("async publish failed without error details")
-	case ack := <-future.Ok():
-		if ack == nil {
-			return nil, fmt.Errorf("received nil publish ack")
-		}
-		return ack, nil
-	case <-timer.C:
-		return nil, fmt.Errorf("timed out after %s", timeout)
-	}
-}
-
-func buildEventMessage(cfg config, event types.ChangeEvent) (*nats.Msg, error) {
-	body, eventType, err := encodeEventJSON(event)
-	if err != nil {
-		return nil, fmt.Errorf("encode change event timestamp=%d: %w", event.Timestamp, err)
-	}
-
-	subject := cfg.subjectForEvent(event.Ledger, eventType)
-	msg := nats.NewMsg(subject)
-	msg.Data = body
-	msg.Header = nats.Header{}
-	msg.Header.Set("Content-Type", "application/json")
-	msg.Header.Set("event_type", eventType)
-	msg.Header.Set("ledger", strconv.FormatUint(uint64(event.Ledger), 10))
-	msg.Header.Set("transfer_code", strconv.FormatUint(uint64(event.TransferCode), 10))
-	msg.Header.Set("debit_account_code", strconv.FormatUint(uint64(event.DebitAccountCode), 10))
-	msg.Header.Set("credit_account_code", strconv.FormatUint(uint64(event.CreditAccountCode), 10))
-	msg.Header.Set(nats.MsgIdHdr, fmt.Sprintf("%s/%d", cfg.clusterIDDecimal, event.Timestamp))
-
-	return msg, nil
 }
 
 func nextQueryTimestamp(lastTimestamp uint64) (uint64, error) {

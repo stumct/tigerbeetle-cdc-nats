@@ -6,9 +6,9 @@ It mirrors `tigerbeetle amqp` semantics while taking advantage of JetStream:
 
 - Polls TigerBeetle `GetChangeEvents` with `timestamp_min = last_timestamp + 1`
 - Publishes JSON events with portable-number encoding compatibility
-- Waits for JetStream publish acknowledgements before writing progress
-- Stores progress and lock state in JetStream KV (stateless runner)
-- Uses deterministic `Nats-Msg-Id` (`<cluster>/<timestamp>`) for de-duplication
+- Appends each event only directly after the one before it, so the stream has no gaps, duplicates or reordering
+- Resumes from the last event in the stream; keeps a fallback checkpoint and the single-writer lock in JetStream KV (stateless runner)
+- Sets a deterministic `Nats-Msg-Id` (`<cluster>/<timestamp>`) on every event
 
 ## Getting started in 5 minutes
 
@@ -54,11 +54,19 @@ nats --server nats://127.0.0.1:4222 sub 'tigerbeetle.cdc.>'
 
 ## Delivery semantics
 
-- Delivery is **at-least-once**.
-- Progress advances only after event publish acknowledgements complete.
-- If the process crashes after event ack but before progress write, events can be replayed.
-- JetStream can suppress replay duplicates inside `--dedupe-window` due to deterministic `Nats-Msg-Id`.
-- Consumers should still be idempotent using `<cluster>/<timestamp>` as a stable event key.
+The event stream is an ordered copy of the cluster's change events:
+
+- Events appear in TigerBeetle timestamp order, each at most once, with no gaps.
+- Every message carries `Nats-Expected-Last-Sequence` set to the stream sequence of the event before it. JetStream rejects a message unless it directly follows that event. So a lost or rejected message, a stream leader change mid-batch, or a second writer cannot leave a gap or reorder events.
+- After a failure, and on every start, publishing resumes after the stream's last event, read from the stream leader. Crashing between publishing and checkpointing therefore doesn't republish anything, however long the restart takes.
+- The KV progress checkpoint is a fallback, used only when retention has removed every event from the stream.
+- Consumers get at-least-once delivery from their JetStream consumer. Use `Nats-Msg-Id` (`<cluster>/<timestamp>`) or the stream sequence as the idempotency key.
+
+Requirements:
+
+- One stream per TigerBeetle cluster, and nothing else may publish to it. The publisher stops if the stream's last message isn't one of its events.
+- Durable JetStream storage. NATS acknowledges a write before flushing it to disk, so on a single server a crash or power cut can lose acknowledged events. The publisher republishes them, but consumers may already have seen them. For financial data, use `--stream-replicas=3` on a NATS cluster, or `sync_interval: always` on a single server.
+- If the stream is deleted and recreated, the publisher refuses to resume into it, because earlier events would be missing. Start it with `--timestamp-last=0` to republish everything, or a later timestamp to start there.
 
 ## Default resource model (cluster-scoped)
 
@@ -167,7 +175,7 @@ TigerBeetle source:
 - `--event-count-max`: max events per `GetChangeEvents` request
 - `--idle-interval-ms`: poll interval while idle
 - `--requests-per-second-limit`: throttle only `GetChangeEvents` requests
-- `--timestamp-last`: override stored progress on startup
+- `--timestamp-last`: publish only events after this timestamp. It moves the start forward, never back (it can't replay into a stream that already holds later events), so it's safe to leave set.
 
 NATS connection:
 
@@ -196,10 +204,10 @@ JetStream provisioning and retention:
 
 Publishing behavior:
 
-- `--publish-mode`: `async` (default) or `sync`
-- `--publish-async-max-pending`: max in-flight async publish requests
-- `--publish-ack-timeout`: publish acknowledgement timeout
-- `--progress-every-events`: checkpoint progress every N published events (`0` = once per fetched batch)
+- `--publish-mode`: `async` (default) pipelines up to `--publish-async-max-pending` unacknowledged messages; `sync` waits for each acknowledgement
+- `--publish-async-max-pending`: max unacknowledged messages in async mode
+- `--publish-ack-timeout`: time allowed for each message's acknowledgement. After a failure the publisher backs off (0.5s doubling to 30s) and resumes from the stream instead of exiting.
+- `--progress-every-events`: deprecated, has no effect
 
 Subject routing:
 

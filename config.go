@@ -46,7 +46,6 @@ const (
 	defaultPublishMode               = publishModeAsync
 	defaultPublishAckTimeout         = 30 * time.Second
 	defaultPublishAsyncPending       = 4096
-	defaultProgressEveryEvents       = uint32(0)
 	maxJetStreamReplicaCount         = 5
 	defaultStreamMaxBytes      int64 = -1
 	// minDedupeWindow is the smallest duplicate window JetStream accepts.
@@ -144,12 +143,19 @@ type config struct {
 	publishAsyncMaxPending int
 
 	eventCountMax          uint32
-	progressEveryEvents    uint32
 	idleInterval           time.Duration
 	requestsPerSecondLimit uint32
 	timestampLast          *uint64
 
 	version string
+}
+
+// maxInFlight is how many published messages may await acknowledgement at once.
+func (c config) maxInFlight() int {
+	if c.publishMode == publishModeSync {
+		return 1
+	}
+	return c.publishAsyncMaxPending
 }
 
 func (c config) progressKey() string {
@@ -190,7 +196,6 @@ func parseConfig(args []string, version string) (config, error) {
 	var kvStorageRaw string
 	var idleIntervalMS uint
 	var eventCountMax uint
-	var progressEveryEvents uint
 	var timestampLast optionalUint64Flag
 	var requestsPerSecondLimit optionalUint32Flag
 
@@ -226,14 +231,15 @@ func parseConfig(args []string, version string) (config, error) {
 	fs.StringVar(&cfg.singleSubject, "subject", defaultSingleSubject, "Subject used when --subject-mode=single")
 
 	fs.StringVar(&publishModeRaw, "publish-mode", string(defaultPublishMode), "Publish mode: async or sync")
-	fs.IntVar(&cfg.publishAsyncMaxPending, "publish-async-max-pending", defaultPublishAsyncPending, "Max in-flight async publish requests")
-	fs.DurationVar(&cfg.publishAckTimeout, "publish-ack-timeout", defaultPublishAckTimeout, "Timeout waiting for JetStream publish ack")
+	fs.IntVar(&cfg.publishAsyncMaxPending, "publish-async-max-pending", defaultPublishAsyncPending, "Max unacknowledged messages in async mode")
+	fs.DurationVar(&cfg.publishAckTimeout, "publish-ack-timeout", defaultPublishAckTimeout, "Timeout for each message's JetStream acknowledgement, from when it is sent")
 
 	fs.UintVar(&eventCountMax, "event-count-max", uint(defaultEventCountMax), "Max change events per TigerBeetle request")
-	fs.UintVar(&progressEveryEvents, "progress-every-events", uint(defaultProgressEveryEvents), "Write progress every N published events (0 = once per fetched batch)")
+	// Kept so existing deployments that pass it still start. Progress now comes from the event stream.
+	fs.Uint("progress-every-events", 0, "Deprecated: has no effect")
 	fs.UintVar(&idleIntervalMS, "idle-interval-ms", uint(defaultIdleInterval/time.Millisecond), "Polling interval when no events are available")
 	fs.Var(&requestsPerSecondLimit, "requests-per-second-limit", "Rate-limit for get_change_events requests")
-	fs.Var(&timestampLast, "timestamp-last", "Start from this last published timestamp (overrides stored progress)")
+	fs.Var(&timestampLast, "timestamp-last", "Publish only events after this timestamp; ignored once the stream is past it")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -255,10 +261,6 @@ func parseConfig(args []string, version string) (config, error) {
 
 	if eventCountMax == 0 || eventCountMax > math.MaxUint32 {
 		return config{}, fmt.Errorf("--event-count-max must be in [1, %d]", uint(math.MaxUint32))
-	}
-
-	if progressEveryEvents > math.MaxUint32 {
-		return config{}, fmt.Errorf("--progress-every-events must be in [0, %d]", uint(math.MaxUint32))
 	}
 
 	if idleIntervalMS == 0 {
@@ -414,7 +416,6 @@ func parseConfig(args []string, version string) (config, error) {
 	cfg.streamStorage = streamStorage
 	cfg.kvStorage = kvStorage
 	cfg.eventCountMax = uint32(eventCountMax)
-	cfg.progressEveryEvents = uint32(progressEveryEvents)
 	cfg.idleInterval = time.Duration(idleIntervalMS) * time.Millisecond
 	cfg.version = version
 

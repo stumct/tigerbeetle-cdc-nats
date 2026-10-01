@@ -169,7 +169,6 @@ func TestIntegration_CDCResumeWithJetStreamState(t *testing.T) {
 		publishAckTimeout:      10 * time.Second,
 		publishAsyncMaxPending: 256,
 		eventCountMax:          128,
-		progressEveryEvents:    0,
 		idleInterval:           100 * time.Millisecond,
 		requestsPerSecondLimit: 0,
 		timestampLast:          nil,
