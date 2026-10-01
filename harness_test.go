@@ -378,9 +378,22 @@ func timestampsOf(events []types.ChangeEvent) []uint64 {
 // It fails as soon as the stream holds anything else.
 func awaitStream(t *testing.T, js nats.JetStreamContext, stream string, want []uint64) {
 	t.Helper()
+	awaitStreamWhileRunning(t, js, stream, want, nil)
+}
+
+// awaitStreamWhileRunning is awaitStream for a stream a run is publishing to: it also fails, with
+// the run's error, if the run stops first.
+func awaitStreamWhileRunning(t *testing.T, js nats.JetStreamContext, stream string, want []uint64, result <-chan error) {
+	t.Helper()
 
 	deadline := time.Now().Add(60 * time.Second)
 	for {
+		select {
+		case err := <-result:
+			t.Fatalf("run stopped before the stream held every event: %v", err)
+		default:
+		}
+
 		// Reads fail until the stream exists, and while a leader election is in progress.
 		got, err := readStreamTimestamps(js, stream)
 		if err == nil {
