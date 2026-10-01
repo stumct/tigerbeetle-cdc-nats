@@ -216,6 +216,27 @@ Subject routing:
 - `--subject-mode=structured` (default) with `--subject-prefix`
 - `--subject-mode=single` with `--subject`
 
+## Metrics
+
+`--metrics-addr=:9464` serves Prometheus metrics at `/metrics` (disabled by default):
+
+| Metric | Meaning |
+|---|---|
+| `tb_cdc_lock_held` | 1 while this instance holds the lock and publishes |
+| `tb_cdc_events_published_total` | events published |
+| `tb_cdc_publish_failures_total` | failed publishes or resumes, each retried from the stream |
+| `tb_cdc_last_event_timestamp_seconds` | TigerBeetle timestamp of the last published event |
+| `tb_cdc_last_poll_timestamp_seconds` | time of the last successful TigerBeetle query |
+| `tb_cdc_caught_up` | 1 if the last query returned less than a full batch |
+| `tb_cdc_build_info{version}` | always 1 |
+
+Suggested alerts:
+
+- No publisher: `sum(tb_cdc_lock_held) == 0` for 2 minutes.
+- Stalled: `tb_cdc_lock_held == 1 and time() - tb_cdc_last_poll_timestamp_seconds > 60`. This covers TigerBeetle being unreachable.
+- Falling behind: `tb_cdc_caught_up == 0 and time() - tb_cdc_last_event_timestamp_seconds > 300`.
+- Repeated failures: `increase(tb_cdc_publish_failures_total[10m]) > 5`.
+
 ## Operational notes
 
 - One instance publishes at a time. Others wait for the lock and log the holder (`owner`, `host`, `pid`, `version`, `updated_at`), so you can run a hot standby.

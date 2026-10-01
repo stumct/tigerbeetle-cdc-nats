@@ -37,6 +37,13 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 		cfg.publishMode,
 	)
 
+	stats := newMetrics(cfg.version)
+	if cfg.metricsAddr != "" {
+		if err := serveMetrics(ctx, cfg.metricsAddr, stats); err != nil {
+			return err
+		}
+	}
+
 	nc, err := connectNATS(cfg)
 	if err != nil {
 		return err
@@ -76,6 +83,8 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 		return err
 	}
 
+	stats.lockHeld.Store(true)
+
 	// runCtx stops replication on shutdown, or when the lock is lost (with the loss as its cause).
 	runCtx, stopRun := context.WithCancelCause(ctx)
 	keepAliveDone := make(chan struct{})
@@ -86,6 +95,7 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 	defer func() {
 		stopRun(context.Canceled)
 		<-keepAliveDone
+		stats.lockHeld.Store(false)
 		if err := lock.release(); err != nil {
 			log.Printf("warning: %v", err)
 		}
@@ -97,7 +107,7 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 		}
 	}
 
-	err = replicate(runCtx, nc, js, progressKV, cfg, openSource)
+	err = replicate(runCtx, nc, js, progressKV, cfg, openSource, stats)
 	// The first cancellation wins: report a lost lock even if a shutdown was requested afterwards.
 	if cause := context.Cause(runCtx); errors.Is(cause, errLockLost) {
 		return cause
@@ -128,6 +138,7 @@ func replicate(
 	progressKV nats.KeyValue,
 	cfg config,
 	openSource func(config) (changeEventSource, error),
+	stats *metrics,
 ) error {
 	source, err := openSource(cfg)
 	if err != nil {
@@ -159,6 +170,7 @@ func replicate(
 		if !isTransient(err) {
 			return err
 		}
+		stats.publishFailures.Add(1)
 		failures++
 		delay := min(minRetryDelay<<min(failures-1, 16), maxRetryDelay)
 		log.Printf("warning: %v; resuming from the stream in %s", err, delay)
@@ -200,6 +212,7 @@ func replicate(
 		if err != nil {
 			return fmt.Errorf("get_change_events(timestamp_min=%d): %w", nextTimestamp, err)
 		}
+		stats.recordPoll(len(events), cfg.eventCountMax)
 
 		if len(events) == 0 {
 			if err := sleepContext(ctx, cfg.idleInterval); err != nil {
@@ -227,6 +240,7 @@ func replicate(
 		}
 		failures = 0
 		lastTimestamp = events[len(events)-1].Timestamp
+		stats.recordPublished(len(events), lastTimestamp)
 
 		// The stream itself records progress. This checkpoint is only read if retention empties the
 		// stream, so a failure here doesn't risk losing or repeating events and need not stop publishing.
