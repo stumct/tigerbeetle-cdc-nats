@@ -200,7 +200,10 @@ Subject routing:
 
 ## Operational notes
 
-- Lock acquisition failure includes lock holder metadata (`owner`, `host`, `pid`, `version`, `updated_at`) when available.
+- One instance publishes at a time. Others wait for the lock and log the holder (`owner`, `host`, `pid`, `version`, `updated_at`), so you can run a hot standby.
+- A standby takes over once the holder releases the lock on shutdown, or within about `--lock-ttl` after the holder dies.
+- A holder retries failed lock renewals until the lock is close to expiring. If it loses the lock, it stops publishing, exits non-zero, and leaves the new holder's lock in place.
+- `SIGINT`/`SIGTERM` stop the publisher, even while TigerBeetle is unreachable, release the lock and exit 0. A second signal exits immediately.
 - The lock bucket must have TTL enabled, and the progress bucket must have TTL disabled.
 - Stream and KV configuration mismatches fail fast with actionable error messages.
 

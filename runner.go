@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -22,31 +22,28 @@ type progressRecord struct {
 	Version   string `json:"version"`
 }
 
-type lockRecord struct {
-	Owner     string `json:"owner"`
-	Hostname  string `json:"hostname"`
-	PID       int    `json:"pid"`
-	Version   string `json:"version"`
-	UpdatedAt string `json:"updated_at"`
-}
-
-type lockHandle struct {
-	kv       nats.KeyValue
-	key      string
-	owner    string
-	hostname string
-	pid      int
-	version  string
-	revision uint64
-}
-
 type pendingPublish struct {
 	future    nats.PubAckFuture
 	timestamp uint64
 	subject   string
 }
 
-func run(ctx context.Context, cfg config) error {
+// changeEventSource is the part of the TigerBeetle client that the runner uses. Tests substitute a
+// fake.
+type changeEventSource interface {
+	GetChangeEvents(filter types.ChangeEventsFilter) ([]types.ChangeEvent, error)
+	Close()
+}
+
+// openTigerBeetle connects to the configured TigerBeetle cluster.
+func openTigerBeetle(cfg config) (changeEventSource, error) {
+	return tigerbeetle_go.NewClient(cfg.clusterID, cfg.addresses)
+}
+
+// run provisions JetStream resources, takes the single-writer lock (waiting while another instance
+// holds it), then publishes change events until ctx is cancelled. A requested shutdown returns nil;
+// losing the lock returns the reason.
+func run(ctx context.Context, cfg config, openSource func(config) (changeEventSource, error)) error {
 	log.Printf(
 		"starting CDC cluster=%s nats=%s stream=%s publish_mode=%s",
 		cfg.clusterIDDecimal,
@@ -95,47 +92,74 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 
-	lock, err := acquireLock(lockKV, cfg.lockKey(), cfg.version)
+	lock, err := acquireLock(ctx, lockKV, cfg.lockKey(), cfg.version, cfg.lockRefresh)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
+
+	// runCtx stops replication on shutdown, or when the lock is lost (with the loss as its cause).
+	runCtx, stopRun := context.WithCancelCause(ctx)
+	keepAliveDone := make(chan struct{})
+	go func() {
+		defer close(keepAliveDone)
+		lock.keepAlive(runCtx, cfg.lockRefresh, cfg.lockTTL, stopRun)
+	}()
 	defer func() {
+		stopRun(context.Canceled)
+		<-keepAliveDone
 		if err := lock.release(); err != nil {
-			log.Printf("warning: release lock: %v", err)
+			log.Printf("warning: %v", err)
 		}
 	}()
 
-	lockCtx, lockCancel := context.WithCancel(ctx)
-	defer lockCancel()
-	lockErrCh := make(chan error, 1)
-	go lock.refreshLoop(lockCtx, cfg.lockRefresh, lockErrCh)
+	err = replicate(runCtx, js, progressKV, cfg, openSource)
+	// The first cancellation wins: report a lost lock even if a shutdown was requested afterwards.
+	if cause := context.Cause(runCtx); errors.Is(cause, errLockLost) {
+		return cause
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
+}
 
+// replicate recovers progress, then repeatedly fetches change events from TigerBeetle and publishes
+// them until ctx is done or an error occurs.
+func replicate(
+	ctx context.Context,
+	js nats.JetStreamContext,
+	progressKV nats.KeyValue,
+	cfg config,
+	openSource func(config) (changeEventSource, error),
+) error {
 	lastTimestamp, err := recoverProgress(cfg, progressKV)
 	if err != nil {
 		return err
 	}
 
-	tbClient, err := tigerbeetle_go.NewClient(cfg.clusterID, cfg.addresses)
+	source, err := openSource(cfg)
 	if err != nil {
 		return fmt.Errorf("create TigerBeetle client: %w", err)
 	}
-	defer tbClient.Close()
+
+	// The TigerBeetle client retries a request forever while the cluster is unreachable, and closing
+	// the client is the only way to interrupt it. Close it as soon as ctx is done.
+	closeSource := sync.OnceFunc(source.Close)
+	defer closeSource()
+	stopCloseOnDone := context.AfterFunc(ctx, closeSource)
+	defer stopCloseOnDone()
 
 	rateLimiter := newRequestRateLimiter(cfg.requestsPerSecondLimit)
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case lockErr := <-lockErrCh:
-			return lockErr
-		default:
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
 		if err := rateLimiter.wait(ctx); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
 			return fmt.Errorf("wait for rate limiter: %w", err)
 		}
 
@@ -144,7 +168,7 @@ func run(ctx context.Context, cfg config) error {
 			return err
 		}
 
-		events, err := tbClient.GetChangeEvents(types.ChangeEventsFilter{
+		events, err := source.GetChangeEvents(types.ChangeEventsFilter{
 			TimestampMin: nextTimestamp,
 			TimestampMax: 0,
 			Limit:        cfg.eventCountMax,
@@ -155,9 +179,6 @@ func run(ctx context.Context, cfg config) error {
 
 		if len(events) == 0 {
 			if err := sleepContext(ctx, cfg.idleInterval); err != nil {
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
 				return err
 			}
 			continue
@@ -450,6 +471,10 @@ func publishEventsAndCheckpoint(
 			return err
 		}
 
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		chunkLastTimestamp := chunk[len(chunk)-1].Timestamp
 		if err := writeProgress(progressKV, cfg.progressKey(), progressRecord{
 			Timestamp: chunkLastTimestamp,
@@ -602,125 +627,6 @@ func buildEventMessage(cfg config, event types.ChangeEvent) (*nats.Msg, error) {
 	msg.Header.Set(nats.MsgIdHdr, fmt.Sprintf("%s/%d", cfg.clusterIDDecimal, event.Timestamp))
 
 	return msg, nil
-}
-
-func acquireLock(kv nats.KeyValue, key string, version string) (*lockHandle, error) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		hostname = "unknown"
-	}
-
-	lock := &lockHandle{
-		kv:       kv,
-		key:      key,
-		hostname: hostname,
-		pid:      os.Getpid(),
-		version:  version,
-		owner:    fmt.Sprintf("%s/%d/%d", hostname, os.Getpid(), time.Now().UnixNano()),
-	}
-
-	payload, err := lock.payload()
-	if err != nil {
-		return nil, err
-	}
-
-	revision, err := kv.Create(key, payload)
-	if err == nil {
-		lock.revision = revision
-		log.Printf("acquired lock %q", key)
-		return lock, nil
-	}
-
-	if errors.Is(err, nats.ErrKeyExists) {
-		entry, getErr := kv.Get(key)
-		if getErr == nil {
-			return nil, fmt.Errorf("lock %q is already held: %s", key, lockHolderDescription(entry))
-		}
-		return nil, fmt.Errorf("lock %q is already held", key)
-	}
-
-	return nil, fmt.Errorf("acquire lock %q: %w", key, err)
-}
-
-func lockHolderDescription(entry nats.KeyValueEntry) string {
-	if entry == nil {
-		return "owner unknown"
-	}
-
-	var holder lockRecord
-	if err := json.Unmarshal(entry.Value(), &holder); err != nil {
-		return fmt.Sprintf("revision=%d (unparseable lock payload)", entry.Revision())
-	}
-
-	return fmt.Sprintf(
-		"owner=%s host=%s pid=%d version=%s updated_at=%s revision=%d",
-		holder.Owner,
-		holder.Hostname,
-		holder.PID,
-		holder.Version,
-		holder.UpdatedAt,
-		entry.Revision(),
-	)
-}
-
-func (l *lockHandle) refreshLoop(ctx context.Context, interval time.Duration, errCh chan<- error) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := l.refresh(); err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
-		}
-	}
-}
-
-func (l *lockHandle) refresh() error {
-	payload, err := l.payload()
-	if err != nil {
-		return err
-	}
-
-	revision, err := l.kv.Update(l.key, payload, l.revision)
-	if err != nil {
-		return fmt.Errorf("refresh lock %q: %w", l.key, err)
-	}
-
-	l.revision = revision
-	return nil
-}
-
-func (l *lockHandle) payload() ([]byte, error) {
-	value := lockRecord{
-		Owner:     l.owner,
-		Hostname:  l.hostname,
-		PID:       l.pid,
-		Version:   l.version,
-		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
-	}
-
-	payload, err := json.Marshal(value)
-	if err != nil {
-		return nil, fmt.Errorf("marshal lock payload: %w", err)
-	}
-
-	return payload, nil
-}
-
-func (l *lockHandle) release() error {
-	err := l.kv.Delete(l.key)
-	if err == nil || errors.Is(err, nats.ErrKeyNotFound) || errors.Is(err, nats.ErrKeyDeleted) {
-		return nil
-	}
-	return fmt.Errorf("release lock %q: %w", l.key, err)
 }
 
 func nextQueryTimestamp(lastTimestamp uint64) (uint64, error) {
