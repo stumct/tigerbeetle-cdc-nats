@@ -230,12 +230,14 @@ Subject routing:
 | `tb_cdc_caught_up` | 1 if the last query returned less than a full batch |
 | `tb_cdc_build_info{version}` | always 1 |
 
-Suggested alerts:
+Suggested alerts (scope `tb_cdc_lock_held` to one cluster's publishers, for example with a `job` label):
 
-- No publisher: `sum(tb_cdc_lock_held) == 0` for 2 minutes.
-- Stalled: `tb_cdc_lock_held == 1 and time() - tb_cdc_last_poll_timestamp_seconds > 60`. This covers TigerBeetle being unreachable.
-- Falling behind: `tb_cdc_caught_up == 0 and time() - tb_cdc_last_event_timestamp_seconds > 300`.
+- No publisher: `(sum(tb_cdc_lock_held) or vector(0)) == 0` for 2 minutes. The `or vector(0)` keeps it firing when every publisher is down.
+- Stalled: `tb_cdc_lock_held == 1 and time() - tb_cdc_last_poll_timestamp_seconds > 60`. This covers TigerBeetle being unreachable, including from the moment the lock was taken.
+- Falling behind: `tb_cdc_lock_held == 1 and tb_cdc_caught_up == 0 and time() - tb_cdc_last_event_timestamp_seconds > 300` for 5 minutes. Standbys don't hold the lock, so they never match.
 - Repeated failures: `increase(tb_cdc_publish_failures_total[10m]) > 5`.
+
+The endpoint has no authentication. Bind it to a private address.
 
 ## Operational notes
 

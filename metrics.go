@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -39,10 +40,10 @@ func (m *metrics) recordPoll(n int, limit uint32) {
 	m.caughtUp.Store(n < int(limit))
 }
 
-// recordPublished records a published batch ending at TigerBeetle timestamp lastTimestamp.
-func (m *metrics) recordPublished(n int, lastTimestamp uint64) {
-	m.eventsPublished.Add(uint64(n))
-	m.lastEventTimestamp.Store(lastTimestamp)
+// recordStored records an event JetStream confirmed it stored.
+func (m *metrics) recordStored(timestamp uint64) {
+	m.eventsPublished.Add(1)
+	m.lastEventTimestamp.Store(timestamp)
 }
 
 // ServeHTTP writes the metrics in the Prometheus text exposition format.
@@ -53,7 +54,7 @@ func (m *metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 
 func (m *metrics) write(w io.Writer) {
 	writeMetric(w, "tb_cdc_build_info", "gauge", "Publisher version.",
-		"{version="+strconv.Quote(m.version)+"}", "1")
+		`{version="`+labelEscaper.Replace(m.version)+`"}`, "1")
 	writeMetric(w, "tb_cdc_lock_held", "gauge", "1 while this instance holds the single-writer lock.",
 		"", boolValue(m.lockHeld.Load()))
 	writeMetric(w, "tb_cdc_events_published_total", "counter", "Change events published to the stream.",
@@ -67,6 +68,9 @@ func (m *metrics) write(w io.Writer) {
 	writeMetric(w, "tb_cdc_caught_up", "gauge", "1 if the last TigerBeetle query returned less than a full batch.",
 		"", boolValue(m.caughtUp.Load()))
 }
+
+// labelEscaper escapes a label value as the Prometheus text format requires.
+var labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
 
 func writeMetric(w io.Writer, name, kind, help, labels, value string) {
 	_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s%s %s\n", name, help, name, kind, name, labels, value)
@@ -93,8 +97,15 @@ func serveMetrics(ctx context.Context, addr string, m *metrics) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", m)
-	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	mux.Handle("GET /metrics", m)
+	// Bound every phase of a request, so slow or stalled clients can't hold connections open.
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
 	go func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -104,7 +115,9 @@ func serveMetrics(ctx context.Context, addr string, m *metrics) error {
 	context.AfterFunc(ctx, func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			_ = server.Close()
+		}
 	})
 
 	log.Printf("serving metrics at http://%s/metrics", listener.Addr())

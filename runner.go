@@ -84,6 +84,8 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 	}
 
 	stats.lockHeld.Store(true)
+	// Count from taking the lock, so a TigerBeetle query that never succeeds still shows as stalled.
+	stats.lastPollUnixNano.Store(time.Now().UnixNano())
 
 	// runCtx stops replication on shutdown, or when the lock is lost (with the loss as its cause).
 	runCtx, stopRun := context.WithCancelCause(ctx)
@@ -193,6 +195,8 @@ func replicate(
 			}
 			lastTimestamp, streamCreated = resumeAt.timestamp, resumeAt.streamCreated
 			publisher = newPublisher(js, cfg, resumeAt.streamSeq, window)
+			publisher.onStored = stats.recordStored
+			stats.lastEventTimestamp.Store(resumeAt.timestamp)
 		}
 
 		if err := rateLimiter.wait(ctx); err != nil {
@@ -240,7 +244,6 @@ func replicate(
 		}
 		failures = 0
 		lastTimestamp = events[len(events)-1].Timestamp
-		stats.recordPublished(len(events), lastTimestamp)
 
 		// The stream itself records progress. This checkpoint is only read if retention empties the
 		// stream, so a failure here doesn't risk losing or repeating events and need not stop publishing.

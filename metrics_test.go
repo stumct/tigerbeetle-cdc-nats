@@ -15,13 +15,14 @@ func TestRun_ServesMetrics(t *testing.T) {
 	addr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
 	cfg := testConfig(t, url, "--metrics-addr="+addr)
 
-	startRun(t, cfg, newFakeSource(testEvent(10), testEvent(20)))
+	// TigerBeetle timestamps are nanoseconds since the Unix epoch.
+	startRun(t, cfg, newFakeSource(testEvent(1_759_300_000_000_000_000), testEvent(1_759_300_001_500_000_000)))
 
 	want := []string{
 		`tb_cdc_build_info{version="test"} 1`,
 		"tb_cdc_lock_held 1",
 		"tb_cdc_events_published_total 2",
-		"tb_cdc_last_event_timestamp_seconds 0.000",
+		"tb_cdc_last_event_timestamp_seconds 1759300001.500",
 		"tb_cdc_caught_up 1",
 		"tb_cdc_publish_failures_total 0",
 	}
@@ -47,5 +48,16 @@ func TestRun_ServesMetrics(t *testing.T) {
 
 	if !strings.Contains(body, "# TYPE tb_cdc_events_published_total counter\n") {
 		t.Fatalf("metrics output lacks TYPE metadata:\n%s", body)
+	}
+}
+
+func TestMetrics_EscapesLabelValues(t *testing.T) {
+	t.Parallel()
+
+	var out strings.Builder
+	newMetrics("v1 \"quoted\"\nline\\x").write(&out)
+	want := `tb_cdc_build_info{version="v1 \"quoted\"\nline\\x"} 1`
+	if !strings.Contains(out.String(), want+"\n") {
+		t.Fatalf("metrics output lacks %s:\n%s", want, out.String())
 	}
 }

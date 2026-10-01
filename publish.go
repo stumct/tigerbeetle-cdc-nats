@@ -34,6 +34,9 @@ type publisher struct {
 	lastSeq uint64
 	// maxInFlight is how many published messages may await acknowledgement at once.
 	maxInFlight int
+	// onStored, if set, is called with each event's timestamp once JetStream confirms it is stored,
+	// including events stored before a later one in the same batch fails.
+	onStored func(timestamp uint64)
 }
 
 func newPublisher(js nats.JetStreamContext, cfg config, lastSeq uint64, maxInFlight int) *publisher {
@@ -133,6 +136,9 @@ func (p *publisher) await(ctx context.Context, pending pendingEvent) error {
 	}
 
 	p.lastSeq = ack.Sequence
+	if p.onStored != nil {
+		p.onStored(pending.timestamp)
+	}
 	return nil
 }
 
