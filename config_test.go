@@ -160,10 +160,10 @@ func TestRedactURLs(t *testing.T) {
 	t.Parallel()
 
 	for input, want := range map[string]string{
-		"nats://127.0.0.1:4222":                         "nats://127.0.0.1:4222",
-		"nats://alice:s3cret@host:4222":                 "nats://[redacted]@host:4222",
+		"nats://127.0.0.1:4222":                          "nats://127.0.0.1:4222",
+		"nats://alice:s3cret@host:4222":                  "nats://[redacted]@host:4222",
 		"tls://token@host:4222,nats://bob:pw@other:4222": "tls://[redacted]@host:4222,nats://[redacted]@other:4222",
-		"user:p@ss@host:4222":                           "[redacted]@host:4222",
+		"user:p@ss@host:4222":                            "[redacted]@host:4222",
 	} {
 		if got := redactURLs(input); got != want {
 			t.Errorf("redactURLs(%q) = %q, want %q", input, got, want)
