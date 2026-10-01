@@ -684,9 +684,12 @@ func reserveTCPPort(t *testing.T) int {
 	if err != nil {
 		t.Fatalf("reserve TCP port: %v", err)
 	}
-	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release reserved TCP port: %v", err)
+	}
 
-	return listener.Addr().(*net.TCPAddr).Port
+	return port
 }
 
 func randomSuffix() string {

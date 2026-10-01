@@ -87,6 +87,7 @@ Headers include:
 Download from GitHub Releases and install manually:
 
 - `tb-cdc-nats_<version>_linux_amd64.tar.gz`
+- `tb-cdc-nats_<version>_linux_arm64.tar.gz`
 - `tb-cdc-nats_<version>_darwin_amd64.tar.gz`
 - `tb-cdc-nats_<version>_darwin_arm64.tar.gz`
 
@@ -134,6 +135,9 @@ For Docker Desktop (macOS/Windows), use `host.docker.internal` instead of `127.0
 
 ### 3) Build from source (development)
 
+Requires Go 1.26 or newer and cgo (the TigerBeetle client links a native library). The `toolchain`
+line in `go.mod` selects the patched Go release used for builds.
+
 ```bash
 go build -o tb-cdc-nats ./cmd/tb-cdc-nats
 ./tb-cdc-nats --help
@@ -144,6 +148,15 @@ go build -o tb-cdc-nats ./cmd/tb-cdc-nats
 ```bash
 go install github.com/stumct/tigerbeetle-cdc-nats/cmd/tb-cdc-nats@latest
 ```
+
+## TigerBeetle compatibility
+
+The publisher uses `tigerbeetle-go` v0.16.72. A TigerBeetle cluster accepts clients from a range of
+releases that ends at its own release, so the client is kept at the oldest release that supports
+change events rather than the newest:
+
+- Supported clusters: TigerBeetle 0.16.72 and newer (CI tests 0.16.72 and 0.17.9).
+- Only raise the client version when you also require clusters to run at least that release.
 
 ## Core flags
 
@@ -228,19 +241,24 @@ Optional container test overrides:
 - `TB_CDC_NATS_PORT` (default: `14222`)
 - `TB_CDC_TIGERBEETLE_PORT` (default: `13000`)
 - `TB_CDC_CLUSTER_ID` (default: `0`)
-- `TB_CDC_TIGERBEETLE_TAG` (default: `latest`)
+- `TB_CDC_TIGERBEETLE_TAG` (default: `0.17.9`)
 
 ## CI
 
-GitHub Actions workflow `/.github/workflows/tests.yml` runs:
+GitHub Actions workflow `/.github/workflows/tests.yml` runs on pull requests, pushes to `main` and weekly:
 
-- unit tests (`go test ./...`)
-- containerized integration tests (`./scripts/integration-test-containers.sh`)
+- `go vet` and unit tests with the race detector
+- `golangci-lint`
+- `govulncheck` (the weekly run flags newly published Go vulnerabilities)
+- containerized integration tests against TigerBeetle 0.16.72 and 0.17.9
+- a Docker image build that checks the binary starts in the runtime image
 
-Tag-based workflow `/.github/workflows/release.yml` publishes:
+Tag-based workflow `/.github/workflows/release.yml` reruns the tests, then publishes:
 
-- release binaries + `SHA256SUMS.txt`
+- release binaries for linux and darwin (amd64 and arm64) + `SHA256SUMS.txt`
 - multi-arch Docker image to `ghcr.io/stumct/tigerbeetle-cdc-nats`
+
+Tags containing `-` (for example `v0.2.0-rc.1`) are published as pre-releases and do not move `latest`.
 
 ## License
 

@@ -5,32 +5,104 @@ on:
   push:
     branches:
       - main
+  schedule:
+    # Weekly run catches newly published Go vulnerabilities and upstream image drift.
+    - cron: "0 6 * * 1"
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout tigerbeetle-cdc-nats
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
-      - name: Run unit tests
-        run: go test ./...
+      - name: Vet
+        run: go vet ./...
 
-  integration_containers:
+      - name: Run unit tests
+        run: go test -race ./...
+
+  lint:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout tigerbeetle-cdc-nats
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.14.0
+          # Build from source so the linter always supports the Go version pinned in go.mod.
+          install-mode: goinstall
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+  integration_containers:
+    name: integration (TigerBeetle ${{ matrix.tigerbeetle }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest cluster release the pinned client supports, and the newest tested release.
+        tigerbeetle: ["0.16.72", "0.17.9"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Run containerized integration test
+        env:
+          TB_CDC_TIGERBEETLE_TAG: ${{ matrix.tigerbeetle }}
         run: ./scripts/integration-test-containers.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: tb-cdc-nats:ci
+
+      - name: Check the binary starts in the runtime image
+        run: docker run --rm tb-cdc-nats:ci --help
