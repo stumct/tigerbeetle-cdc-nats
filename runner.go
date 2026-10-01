@@ -180,10 +180,6 @@ func replicate(
 				continue
 			}
 			lastTimestamp, streamCreated = resumeAt.timestamp, resumeAt.streamCreated
-			if next := publishWindow(cfg, nc.ConnectedServerVersion()); next != window {
-				log.Printf("publishing up to %d messages at a time (connected to nats-server %s)", next, nc.ConnectedServerVersion())
-				window = next
-			}
 			publisher = newPublisher(js, cfg, resumeAt.streamSeq, window)
 		}
 
@@ -212,6 +208,14 @@ func replicate(
 			continue
 		}
 
+		// Check before every batch: a reconnect between batches can land on a different server version
+		// without any publish failing. Nothing is in flight between batches, so the limit can change.
+		if next := publishWindow(cfg, nc.ConnectedServerVersion()); next != window {
+			log.Printf("publishing up to %d messages at a time (connected to nats-server %s)", next, nc.ConnectedServerVersion())
+			window = next
+		}
+		publisher.maxInFlight = window
+
 		if err := publisher.publish(ctx, events); err != nil {
 			if ctx.Err() != nil {
 				return err
@@ -238,8 +242,8 @@ func replicate(
 // Before 2.14, nats-server ignores a failed write while applying a message to a replicated stream, so
 // a message pipelined behind it can take its place and leave a gap. Publishing to a replicated stream
 // is serialised when connected to such a server. The client only sees the version of the server it is
-// connected to, so this runs on every resume (after reconnects), and clusters running mixed versions
-// must use --publish-mode=sync until every server runs 2.14 or later.
+// connected to, so this runs before every batch (covering reconnects), and clusters running mixed
+// versions must use --publish-mode=sync until every server runs 2.14 or later.
 func publishWindow(cfg config, connectedServerVersion string) int {
 	if cfg.streamReplicas > 1 && !serverAtLeast(connectedServerVersion, 2, 14) {
 		return 1
