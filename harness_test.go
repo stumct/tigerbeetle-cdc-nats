@@ -58,18 +58,19 @@ func connectJetStream(t *testing.T, url string) nats.JetStreamContext {
 	return js
 }
 
-// testConfig returns a valid config for cluster 7 with short intervals, as parseConfig would build it.
-func testConfig(t *testing.T, natsURL string) config {
+// testConfig returns a valid config for cluster 7 with short intervals, as parseConfig would build it
+// from these flags plus extraArgs.
+func testConfig(t *testing.T, natsURL string, extraArgs ...string) config {
 	t.Helper()
 
-	cfg, err := parseConfig([]string{
+	cfg, err := parseConfig(append([]string{
 		"--cluster-id=7",
 		"--addresses=127.0.0.1:3000",
 		"--nats-url=" + natsURL,
 		"--idle-interval-ms=20",
 		"--lock-ttl=2s",
 		"--lock-refresh=100ms",
-	}, "test")
+	}, extraArgs...), "test")
 	if err != nil {
 		t.Fatalf("parseConfig(): %v", err)
 	}

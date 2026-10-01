@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 func TestRun_PublishesEventsAndCheckpoints(t *testing.T) {
@@ -117,4 +119,39 @@ func TestRun_ShutsDownWhileWaitingForLock(t *testing.T) {
 		t.Fatalf("lock holder exited: %v", err)
 	default:
 	}
+}
+
+func TestRun_StandbyUpdatesStreamOnlyAfterTakingTheLock(t *testing.T) {
+	t.Parallel()
+	url := startJetStream(t)
+	js := connectJetStream(t, url)
+	cfg := testConfig(t, url)
+
+	stopHolder, holder := startRun(t, cfg, newFakeSource())
+	eventually(t, 5*time.Second, "holder to take the lock", func() bool { return lockOwner(t, js, cfg) != "" })
+
+	// A standby with a different stream config must not change the stream under the holder.
+	startRun(t, testConfig(t, url, "--stream-max-age=1h", "--stream-update"), newFakeSource())
+	time.Sleep(300 * time.Millisecond)
+	if maxAge := streamMaxAge(t, js, cfg.eventStream); maxAge != 0 {
+		t.Fatalf("stream max age = %s while the holder runs, want unchanged", maxAge)
+	}
+
+	stopHolder()
+	if err := awaitResult(t, holder, 5*time.Second); err != nil {
+		t.Fatalf("holder run() error = %v", err)
+	}
+	eventually(t, 10*time.Second, "the new holder to update the stream", func() bool {
+		return streamMaxAge(t, js, cfg.eventStream) == time.Hour
+	})
+}
+
+func streamMaxAge(t *testing.T, js nats.JetStreamContext, stream string) time.Duration {
+	t.Helper()
+
+	info, err := js.StreamInfo(stream)
+	if err != nil {
+		t.Fatalf("StreamInfo(%q): %v", stream, err)
+	}
+	return info.Config.MaxAge
 }
