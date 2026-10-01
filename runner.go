@@ -37,6 +37,13 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 		cfg.publishMode,
 	)
 
+	stats := newMetrics(cfg.version)
+	if cfg.metricsAddr != "" {
+		if err := serveMetrics(ctx, cfg.metricsAddr, stats); err != nil {
+			return err
+		}
+	}
+
 	nc, err := connectNATS(cfg)
 	if err != nil {
 		return err
@@ -76,15 +83,24 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 		return err
 	}
 
+	stats.lockHeld.Store(true)
+	// Count from taking the lock, so a TigerBeetle query that never succeeds still shows as stalled.
+	stats.lastPollUnixNano.Store(time.Now().UnixNano())
+
 	// runCtx stops replication on shutdown, or when the lock is lost (with the loss as its cause).
 	runCtx, stopRun := context.WithCancelCause(ctx)
 	keepAliveDone := make(chan struct{})
 	go func() {
 		defer close(keepAliveDone)
-		lock.keepAlive(runCtx, cfg.lockRefresh, cfg.lockTTL, stopRun)
+		lock.keepAlive(runCtx, cfg.lockRefresh, cfg.lockTTL, func(err error) {
+			stats.lockHeld.Store(false)
+			stopRun(err)
+		})
 	}()
 	defer func() {
 		stopRun(context.Canceled)
+		// Stop reporting the lock before waiting for a renewal that may hang.
+		stats.lockHeld.Store(false)
 		<-keepAliveDone
 		if err := lock.release(); err != nil {
 			log.Printf("warning: %v", err)
@@ -97,7 +113,7 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 		}
 	}
 
-	err = replicate(runCtx, nc, js, progressKV, cfg, openSource)
+	err = replicate(runCtx, nc, js, progressKV, cfg, openSource, stats)
 	// The first cancellation wins: report a lost lock even if a shutdown was requested afterwards.
 	if cause := context.Cause(runCtx); errors.Is(cause, errLockLost) {
 		return cause
@@ -128,6 +144,7 @@ func replicate(
 	progressKV nats.KeyValue,
 	cfg config,
 	openSource func(config) (changeEventSource, error),
+	stats *metrics,
 ) error {
 	source, err := openSource(cfg)
 	if err != nil {
@@ -159,6 +176,7 @@ func replicate(
 		if !isTransient(err) {
 			return err
 		}
+		stats.publishFailures.Add(1)
 		failures++
 		delay := min(minRetryDelay<<min(failures-1, 16), maxRetryDelay)
 		log.Printf("warning: %v; resuming from the stream in %s", err, delay)
@@ -181,6 +199,8 @@ func replicate(
 			}
 			lastTimestamp, streamCreated = resumeAt.timestamp, resumeAt.streamCreated
 			publisher = newPublisher(js, cfg, resumeAt.streamSeq, window)
+			publisher.onStored = stats.recordStored
+			stats.recordResume(resumeAt)
 		}
 
 		if err := rateLimiter.wait(ctx); err != nil {
@@ -200,6 +220,7 @@ func replicate(
 		if err != nil {
 			return fmt.Errorf("get_change_events(timestamp_min=%d): %w", nextTimestamp, err)
 		}
+		stats.recordPoll(len(events))
 
 		if len(events) == 0 {
 			if err := sleepContext(ctx, cfg.idleInterval); err != nil {

@@ -34,6 +34,9 @@ type publisher struct {
 	lastSeq uint64
 	// maxInFlight is how many published messages may await acknowledgement at once.
 	maxInFlight int
+	// onStored, if set, is called with each event's stream sequence and timestamp once JetStream
+	// confirms it is stored, including events stored before a later one in the same batch fails.
+	onStored func(sequence uint64, timestamp uint64)
 }
 
 func newPublisher(js nats.JetStreamContext, cfg config, lastSeq uint64, maxInFlight int) *publisher {
@@ -67,14 +70,14 @@ func (p *publisher) publish(ctx context.Context, events []types.ChangeEvent) err
 	for _, event := range events {
 		if len(inFlight) == maxInFlight {
 			if err := p.await(ctx, inFlight[0]); err != nil {
-				return settle(ctx, inFlight[1:], err)
+				return p.settle(ctx, inFlight[1:], err)
 			}
 			inFlight = inFlight[1:]
 		}
 
 		msg, err := buildEventMessage(p.cfg, event)
 		if err != nil {
-			return settle(ctx, inFlight, err)
+			return p.settle(ctx, inFlight, err)
 		}
 		msg.Header.Set(nats.ExpectedStreamHdr, p.cfg.eventStream)
 		msg.Header.Set(nats.ExpectedLastSeqHdr, strconv.FormatUint(nextSeq-1, 10))
@@ -82,7 +85,7 @@ func (p *publisher) publish(ctx context.Context, events []types.ChangeEvent) err
 		future, err := p.js.PublishMsgAsync(msg)
 		if err != nil {
 			err = fmt.Errorf("publish event timestamp=%d subject=%q: %w", event.Timestamp, msg.Subject, err)
-			return settle(ctx, inFlight, err)
+			return p.settle(ctx, inFlight, err)
 		}
 
 		inFlight = append(inFlight, pendingEvent{
@@ -96,7 +99,7 @@ func (p *publisher) publish(ctx context.Context, events []types.ChangeEvent) err
 
 	for i, pending := range inFlight {
 		if err := p.await(ctx, pending); err != nil {
-			return settle(ctx, inFlight[i+1:], err)
+			return p.settle(ctx, inFlight[i+1:], err)
 		}
 	}
 	return nil
@@ -133,15 +136,22 @@ func (p *publisher) await(ctx context.Context, pending pendingEvent) error {
 	}
 
 	p.lastSeq = ack.Sequence
+	if p.onStored != nil {
+		p.onStored(ack.Sequence, pending.timestamp)
+	}
 	return nil
 }
 
 // settle waits for each outstanding message to be acknowledged, rejected or timed out, then returns
-// err. It stops waiting if ctx is done, because the run is ending and won't publish again.
-func settle(ctx context.Context, outstanding []pendingEvent, err error) error {
+// err. Messages stored meanwhile are still reported to onStored. It stops waiting if ctx is done,
+// because the run is ending and won't publish again.
+func (p *publisher) settle(ctx context.Context, outstanding []pendingEvent, err error) error {
 	for _, pending := range outstanding {
 		select {
-		case <-pending.future.Ok():
+		case ack := <-pending.future.Ok():
+			if ack != nil && ack.Stream == p.cfg.eventStream && !ack.Duplicate && p.onStored != nil {
+				p.onStored(ack.Sequence, pending.timestamp)
+			}
 		case <-pending.future.Err():
 		case <-ctx.Done():
 			return err

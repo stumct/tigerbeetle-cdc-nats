@@ -147,6 +147,8 @@ type config struct {
 	requestsPerSecondLimit uint32
 	timestampLast          *uint64
 
+	metricsAddr string
+
 	version string
 }
 
@@ -239,6 +241,7 @@ func parseConfig(args []string, version string) (config, error) {
 	fs.Uint("progress-every-events", 0, "Deprecated: has no effect")
 	fs.UintVar(&idleIntervalMS, "idle-interval-ms", uint(defaultIdleInterval/time.Millisecond), "Polling interval when no events are available")
 	fs.Var(&requestsPerSecondLimit, "requests-per-second-limit", "Rate-limit for get_change_events requests")
+	fs.StringVar(&cfg.metricsAddr, "metrics-addr", "", "Serve Prometheus metrics at http://<addr>/metrics, for example :9464 (default: disabled)")
 	fs.Var(&timestampLast, "timestamp-last", "Publish only events after this timestamp, when the stream has no position to continue from")
 
 	if err := fs.Parse(args); err != nil {
