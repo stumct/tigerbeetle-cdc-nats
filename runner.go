@@ -76,7 +76,7 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 		return fmt.Errorf("create JetStream context: %w", err)
 	}
 
-	if err := ensureEventStream(js, cfg); err != nil {
+	if err := ensureEventStream(js, cfg, false); err != nil {
 		return err
 	}
 
@@ -112,6 +112,12 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 			log.Printf("warning: %v", err)
 		}
 	}()
+
+	if cfg.streamUpdate {
+		if err := ensureEventStream(js, cfg, true); err != nil {
+			return err
+		}
+	}
 
 	err = replicate(runCtx, js, progressKV, cfg, openSource)
 	// The first cancellation wins: report a lost lock even if a shutdown was requested afterwards.

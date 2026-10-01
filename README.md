@@ -180,7 +180,7 @@ NATS connection:
 JetStream provisioning and retention:
 
 - `--provision`: create missing stream/KV buckets (default: true)
-- `--stream-update`: update mismatched stream config (requires `--provision=true`)
+- `--stream-update`: update mismatched stream config (requires `--provision=true`). The update is applied only once this instance holds the lock, so a standby never changes the stream under the active publisher.
 - `--stream`: override stream name
 - `--stream-replicas`: stream replica count
 - `--stream-storage`: `file` or `memory`

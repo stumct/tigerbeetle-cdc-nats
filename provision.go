@@ -49,9 +49,11 @@ func desiredLockKVConfig(cfg config) nats.KeyValueConfig {
 }
 
 // ensureEventStream creates the event stream if it is missing (when provisioning is enabled) and
-// checks that an existing stream matches the required configuration, updating it if
-// --stream-update is set.
-func ensureEventStream(js nats.JetStreamContext, cfg config) error {
+// checks that an existing stream matches the required configuration. With --stream-update, a
+// mismatched stream is updated only when applyUpdate is set: callers set it once they hold the
+// lock, because changing the stream (its subjects, for example) under another instance that is
+// still publishing would break that instance.
+func ensureEventStream(js nats.JetStreamContext, cfg config, applyUpdate bool) error {
 	desired := desiredEventStreamConfig(cfg)
 
 	info, err := js.StreamInfo(desired.Name)
@@ -82,6 +84,14 @@ func ensureEventStream(js nats.JetStreamContext, cfg config) error {
 	}
 
 	if cfg.provision && cfg.streamUpdate {
+		if !applyUpdate {
+			log.Printf(
+				"stream %q config differs (%s); it will be updated once this instance holds the lock",
+				desired.Name,
+				strings.Join(mismatches, "; "),
+			)
+			return nil
+		}
 		if _, err := js.UpdateStream(desired); err != nil {
 			return fmt.Errorf("update stream %q: %w", desired.Name, err)
 		}
