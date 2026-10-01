@@ -81,7 +81,11 @@ func TestRun_ShutsDownWhileTigerBeetleIsUnreachable(t *testing.T) {
 	source := newFakeSource()
 	source.unreachable = true
 	cancel, result := startRun(t, cfg, source)
-	eventually(t, 5*time.Second, "run to take the lock", func() bool { return lockOwner(t, js, cfg) != "" })
+	select {
+	case <-source.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("run never queried TigerBeetle")
+	}
 
 	cancel()
 	if err := awaitResult(t, result, 5*time.Second); err != nil {

@@ -12,6 +12,9 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// errLockLost marks errors reporting that this instance no longer holds the lock.
+var errLockLost = errors.New("lost lock")
+
 // lockRecord is the JSON value stored under the lock key. It identifies the holder so that a
 // waiting instance can report who holds the lock.
 type lockRecord struct {
@@ -75,7 +78,9 @@ func acquireLock(ctx context.Context, kv nats.KeyValue, key string, version stri
 			return lock, nil
 		}
 
-		if !errors.Is(err, nats.ErrKeyExists) {
+		// Create reports a held key as ErrKeyExists, but when racing another instance to replace a
+		// deleted key it can return the raw wrong-last-sequence error instead.
+		if !errors.Is(err, nats.ErrKeyExists) && !isWrongLastSequence(err) {
 			return nil, fmt.Errorf("acquire lock %q: %w", key, err)
 		}
 
@@ -115,37 +120,63 @@ func lockHolder(kv nats.KeyValue, key string) (owner string, description string)
 	)
 }
 
-// keepAlive renews the lock every interval until ctx is cancelled. A failed renewal is retried until
-// the lock is close to expiring. If another instance now holds the lock, or it cannot be renewed in
-// time, keepAlive calls onLost with the reason and returns.
+// keepAlive renews the lock every interval until ctx is cancelled. Failed renewals are retried. It
+// calls onLost and returns if another instance takes the lock, or if no renewal succeeds before the
+// lock comes within ttl/10 of expiring. That deadline has its own timer, so a slow or hung renewal
+// request cannot delay onLost.
 func (l *lockHandle) keepAlive(ctx context.Context, interval time.Duration, ttl time.Duration, onLost func(error)) {
-	// Stop trying this long before the lock could expire, leaving time to stop publishing.
-	margin := ttl / 10
+	// Give up this long before the lock could expire, leaving time to stop publishing.
+	safeUntil := func() time.Duration { return time.Until(l.renewedAt.Add(ttl - ttl/10)) }
 	retryInterval := min(time.Second, interval)
 
-	timer := time.NewTimer(interval)
-	defer timer.Stop()
+	renewTimer := time.NewTimer(interval)
+	defer renewTimer.Stop()
+	expiryTimer := time.NewTimer(safeUntil())
+	defer expiryTimer.Stop()
 
+	// inFlight receives the result of the outstanding renewal request, and is nil when there is none.
+	// renew writes l.revision and l.renewedAt, so keepAlive waits for it before returning: release
+	// must not run concurrently with it.
+	var inFlight chan error
+	defer func() {
+		if inFlight != nil {
+			<-inFlight
+		}
+	}()
+
+	var lastErr error
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-timer.C:
-		}
 
-		err := l.renew()
-		switch {
-		case err == nil:
-			timer.Reset(interval)
-		case errors.Is(err, nats.ErrKeyRevisionMismatch):
-			onLost(fmt.Errorf("lost lock %q: another instance holds it or it expired: %w", l.key, err))
+		case <-expiryTimer.C:
+			reason := "a renewal request did not complete in time"
+			if lastErr != nil {
+				reason = lastErr.Error()
+			}
+			onLost(fmt.Errorf("%w %q: could not renew it before it could expire: %s", errLockLost, l.key, reason))
 			return
-		case time.Until(l.renewedAt.Add(ttl)) <= margin:
-			onLost(fmt.Errorf("lost lock %q: could not renew it before it expires: %w", l.key, err))
-			return
-		default:
-			log.Printf("warning: renew lock %q: %v; retrying", l.key, err)
-			timer.Reset(retryInterval)
+
+		case <-renewTimer.C:
+			inFlight = make(chan error, 1)
+			go func(result chan<- error) { result <- l.renew() }(inFlight)
+
+		case err := <-inFlight:
+			inFlight = nil
+			switch {
+			case err == nil:
+				lastErr = nil
+				expiryTimer.Reset(safeUntil())
+				renewTimer.Reset(interval)
+			case errors.Is(err, nats.ErrKeyRevisionMismatch):
+				onLost(fmt.Errorf("%w %q: another instance holds it or it expired: %w", errLockLost, l.key, err))
+				return
+			default:
+				lastErr = err
+				log.Printf("warning: renew lock %q: %v; retrying", l.key, err)
+				renewTimer.Reset(retryInterval)
+			}
 		}
 	}
 }
@@ -199,4 +230,15 @@ func (l *lockHandle) release() error {
 	default:
 		return fmt.Errorf("release lock %q: %w", l.key, err)
 	}
+}
+
+// isWrongLastSequence reports whether err is JetStream rejecting a conditional write because the
+// stream or subject has moved on. Non-replicated streams report code 10071, replicated ones 10164.
+func isWrongLastSequence(err error) bool {
+	var apiErr *nats.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.ErrorCode == nats.JSErrCodeStreamWrongLastSequence ||
+		apiErr.ErrorCode == nats.JSErrCodeStreamWrongLastSequenceConstant
 }

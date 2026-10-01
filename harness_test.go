@@ -78,9 +78,11 @@ func testConfig(t *testing.T, natsURL string) config {
 
 // fakeSource is an in-memory changeEventSource that serves its events in timestamp order. When
 // unreachable is set, GetChangeEvents blocks until Close, like the real client when no replica
-// answers.
+// answers, and closes blocked first.
 type fakeSource struct {
 	unreachable bool
+	blocked     chan struct{}
+	blockOnce   sync.Once
 
 	mu        sync.Mutex
 	events    []types.ChangeEvent
@@ -89,11 +91,12 @@ type fakeSource struct {
 }
 
 func newFakeSource(events ...types.ChangeEvent) *fakeSource {
-	return &fakeSource{events: events, closed: make(chan struct{})}
+	return &fakeSource{events: events, blocked: make(chan struct{}), closed: make(chan struct{})}
 }
 
 func (f *fakeSource) GetChangeEvents(filter types.ChangeEventsFilter) ([]types.ChangeEvent, error) {
 	if f.unreachable {
+		f.blockOnce.Do(func() { close(f.blocked) })
 		<-f.closed
 	}
 	select {

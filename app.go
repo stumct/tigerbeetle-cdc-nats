@@ -24,8 +24,8 @@ func RunCLI(args []string, version string) int {
 	defer stop()
 	// After the first signal, restore default handling so a second signal exits immediately.
 	context.AfterFunc(ctx, func() {
-		log.Printf("shutdown requested; stopping (signal again to exit immediately)")
 		stop()
+		log.Printf("shutdown requested; stopping (signal again to exit immediately)")
 	})
 
 	if err := run(ctx, cfg, openTigerBeetle); err != nil {

@@ -116,11 +116,12 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 	}()
 
 	err = replicate(runCtx, js, progressKV, cfg, openSource)
+	// The first cancellation wins: report a lost lock even if a shutdown was requested afterwards.
+	if cause := context.Cause(runCtx); errors.Is(cause, errLockLost) {
+		return cause
+	}
 	if ctx.Err() != nil {
 		return nil
-	}
-	if cause := context.Cause(runCtx); cause != nil {
-		return cause
 	}
 	return err
 }

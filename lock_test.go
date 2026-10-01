@@ -3,6 +3,7 @@ package cdcnats
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -137,5 +138,67 @@ func TestKeepAlive_ReportsTakeover(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("keepAlive did not report the takeover")
+	}
+}
+
+// stallingKV is a KeyValue whose Update blocks until release is closed, like a request to an
+// unresponsive server.
+type stallingKV struct {
+	nats.KeyValue
+	release chan struct{}
+}
+
+func (s stallingKV) Update(string, []byte, uint64) (uint64, error) {
+	<-s.release
+	return 0, nats.ErrTimeout
+}
+
+func TestKeepAlive_ReportsLossWhenRenewalHangs(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	lock := &lockHandle{kv: stallingKV{release: release}, key: "lock.7", renewedAt: time.Now()}
+
+	lost := make(chan error, 1)
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		lock.keepAlive(context.Background(), 20*time.Millisecond, 500*time.Millisecond, func(err error) { lost <- err })
+	}()
+
+	select {
+	case err := <-lost:
+		if !errors.Is(err, errLockLost) {
+			t.Fatalf("loss error = %v, want errLockLost", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("keepAlive did not report loss while a renewal was hanging")
+	}
+
+	// keepAlive waits for the hung request before returning, so release never races a renewal.
+	select {
+	case <-returned:
+		t.Fatalf("keepAlive returned while a renewal was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	<-returned
+}
+
+func TestIsWrongLastSequence(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{&nats.APIError{ErrorCode: nats.JSErrCodeStreamWrongLastSequence}, true},
+		{fmt.Errorf("wrapped: %w", &nats.APIError{ErrorCode: nats.JSErrCodeStreamWrongLastSequenceConstant}), true},
+		{&nats.APIError{ErrorCode: nats.JSErrCodeStreamNotFound}, false},
+		{nats.ErrTimeout, false},
+	} {
+		if got := isWrongLastSequence(tc.err); got != tc.want {
+			t.Errorf("isWrongLastSequence(%v) = %v, want %v", tc.err, got, tc.want)
+		}
 	}
 }
