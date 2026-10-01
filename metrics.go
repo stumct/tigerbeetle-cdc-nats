@@ -26,7 +26,8 @@ type metrics struct {
 	lastEventTimestamp atomic.Uint64
 	// lastPollUnixNano is the wall-clock time of the last successful TigerBeetle query.
 	lastPollUnixNano atomic.Int64
-	// caughtUp is set when the last query returned fewer events than it asked for.
+	// caughtUp is set when the last query returned no events. TigerBeetle caps each response below the
+	// requested limit, so a short batch doesn't mean the publisher has caught up.
 	caughtUp atomic.Bool
 }
 
@@ -34,10 +35,10 @@ func newMetrics(version string) *metrics {
 	return &metrics{version: version}
 }
 
-// recordPoll records a successful TigerBeetle query that returned n of at most limit events.
-func (m *metrics) recordPoll(n int, limit uint32) {
+// recordPoll records a successful TigerBeetle query that returned n events.
+func (m *metrics) recordPoll(n int) {
 	m.lastPollUnixNano.Store(time.Now().UnixNano())
-	m.caughtUp.Store(n < int(limit))
+	m.caughtUp.Store(n == 0)
 }
 
 // recordStored records an event JetStream confirmed it stored.
@@ -65,7 +66,7 @@ func (m *metrics) write(w io.Writer) {
 		"", seconds(int64(m.lastEventTimestamp.Load())))
 	writeMetric(w, "tb_cdc_last_poll_timestamp_seconds", "gauge", "Time of the last successful TigerBeetle query.",
 		"", seconds(m.lastPollUnixNano.Load()))
-	writeMetric(w, "tb_cdc_caught_up", "gauge", "1 if the last TigerBeetle query returned less than a full batch.",
+	writeMetric(w, "tb_cdc_caught_up", "gauge", "1 if the last TigerBeetle query found no new events.",
 		"", boolValue(m.caughtUp.Load()))
 }
 

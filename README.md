@@ -227,7 +227,7 @@ Subject routing:
 | `tb_cdc_publish_failures_total` | failed publishes or resumes, each retried from the stream |
 | `tb_cdc_last_event_timestamp_seconds` | TigerBeetle timestamp of the last published event |
 | `tb_cdc_last_poll_timestamp_seconds` | time of the last successful TigerBeetle query |
-| `tb_cdc_caught_up` | 1 if the last query returned less than a full batch |
+| `tb_cdc_caught_up` | 1 if the last query found no new events |
 | `tb_cdc_build_info{version}` | always 1 |
 
 Suggested alerts (scope `tb_cdc_lock_held` to one cluster's publishers, for example with a `job` label):

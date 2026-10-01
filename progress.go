@@ -45,6 +45,9 @@ type position struct {
 	streamSeq uint64
 	// streamCreated identifies the stream incarnation the position belongs to; checkpoints record it.
 	streamCreated time.Time
+	// storedTimestamp is the timestamp of the last event known to be stored (the stream's last event,
+	// or the checkpoint's), or 0 if unknown. It differs from timestamp after --timestamp-last.
+	storedTimestamp uint64
 }
 
 // recoverPosition decides where publishing resumes. Reads go to the stream leaders, never to
@@ -74,7 +77,7 @@ func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
 			log.Printf("ignoring --timestamp-last=%d: stream %q already holds events", *override, cfg.eventStream)
 		}
 		log.Printf("resuming after the stream's last event: timestamp=%d stream_seq=%d", tail.timestamp, lastSeq)
-		return position{timestamp: tail.timestamp, streamSeq: lastSeq, streamCreated: created}, nil
+		return position{timestamp: tail.timestamp, streamSeq: lastSeq, streamCreated: created, storedTimestamp: tail.timestamp}, nil
 	}
 
 	progress, found, err := readProgress(js, cfg)
@@ -92,7 +95,7 @@ func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
 			progress.Timestamp,
 			lastSeq,
 		)
-		return position{timestamp: progress.Timestamp, streamSeq: lastSeq, streamCreated: created}, nil
+		return position{timestamp: progress.Timestamp, streamSeq: lastSeq, streamCreated: created, storedTimestamp: progress.Timestamp}, nil
 	}
 
 	if override != nil {

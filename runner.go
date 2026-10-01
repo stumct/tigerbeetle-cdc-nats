@@ -92,12 +92,16 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 	keepAliveDone := make(chan struct{})
 	go func() {
 		defer close(keepAliveDone)
-		lock.keepAlive(runCtx, cfg.lockRefresh, cfg.lockTTL, stopRun)
+		lock.keepAlive(runCtx, cfg.lockRefresh, cfg.lockTTL, func(err error) {
+			stats.lockHeld.Store(false)
+			stopRun(err)
+		})
 	}()
 	defer func() {
 		stopRun(context.Canceled)
-		<-keepAliveDone
+		// Stop reporting the lock before waiting for a renewal that may hang.
 		stats.lockHeld.Store(false)
+		<-keepAliveDone
 		if err := lock.release(); err != nil {
 			log.Printf("warning: %v", err)
 		}
@@ -196,7 +200,9 @@ func replicate(
 			lastTimestamp, streamCreated = resumeAt.timestamp, resumeAt.streamCreated
 			publisher = newPublisher(js, cfg, resumeAt.streamSeq, window)
 			publisher.onStored = stats.recordStored
-			stats.lastEventTimestamp.Store(resumeAt.timestamp)
+			if resumeAt.storedTimestamp > 0 {
+				stats.lastEventTimestamp.Store(resumeAt.storedTimestamp)
+			}
 		}
 
 		if err := rateLimiter.wait(ctx); err != nil {
@@ -216,7 +222,7 @@ func replicate(
 		if err != nil {
 			return fmt.Errorf("get_change_events(timestamp_min=%d): %w", nextTimestamp, err)
 		}
-		stats.recordPoll(len(events), cfg.eventCountMax)
+		stats.recordPoll(len(events))
 
 		if len(events) == 0 {
 			if err := sleepContext(ctx, cfg.idleInterval); err != nil {
