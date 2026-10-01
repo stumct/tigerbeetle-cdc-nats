@@ -184,19 +184,15 @@ type fakeSource struct {
 	events    []types.ChangeEvent
 	closed    chan struct{}
 	closeOnce sync.Once
-	// served counts queries per TimestampMin that returned events; refetches counts repeats of those,
-	// which happen only when publishing resumes after a failure.
-	served    map[uint64]bool
-	refetches int
+	// highestServed is the latest timestamp returned so far. Normally each query starts after it;
+	// refetches counts queries that start at or before it, which happen only when publishing resumes
+	// after a failure left some served events unpublished.
+	highestServed uint64
+	refetches     int
 }
 
 func newFakeSource(events ...types.ChangeEvent) *fakeSource {
-	return &fakeSource{
-		events:  events,
-		blocked: make(chan struct{}),
-		closed:  make(chan struct{}),
-		served:  map[uint64]bool{},
-	}
+	return &fakeSource{events: events, blocked: make(chan struct{}), closed: make(chan struct{})}
 }
 
 func (f *fakeSource) GetChangeEvents(filter types.ChangeEventsFilter) ([]types.ChangeEvent, error) {
@@ -220,10 +216,10 @@ func (f *fakeSource) GetChangeEvents(filter types.ChangeEventsFilter) ([]types.C
 		}
 	}
 	if len(batch) > 0 {
-		if f.served[filter.TimestampMin] {
+		if filter.TimestampMin <= f.highestServed {
 			f.refetches++
 		}
-		f.served[filter.TimestampMin] = true
+		f.highestServed = max(f.highestServed, batch[len(batch)-1].Timestamp)
 		if f.beforeBatch != nil {
 			f.beforeBatch()
 		}

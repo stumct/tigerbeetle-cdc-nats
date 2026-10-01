@@ -43,17 +43,6 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 	}
 	defer nc.Close()
 
-	// Before 2.14, nats-server ignores a failed write while applying a message to a replicated stream,
-	// so a message pipelined behind it can be stored in its place and leave a gap. Publish one message
-	// at a time there.
-	if cfg.publishMode == publishModeAsync && cfg.streamReplicas > 1 && !serverAtLeast(nc.ConnectedServerVersion(), 2, 14) {
-		log.Printf(
-			"warning: nats-server %s is older than 2.14, so replicated streams are published with --publish-mode=sync",
-			nc.ConnectedServerVersion(),
-		)
-		cfg.publishMode = publishModeSync
-	}
-
 	js, err := nc.JetStream(
 		// The publisher bounds its own outstanding messages, so the client's limit is never the one hit.
 		nats.PublishAsyncMaxPending(cfg.maxInFlight()),
@@ -108,7 +97,7 @@ func run(ctx context.Context, cfg config, openSource func(config) (changeEventSo
 		}
 	}
 
-	err = replicate(runCtx, js, progressKV, cfg, openSource)
+	err = replicate(runCtx, nc, js, progressKV, cfg, openSource)
 	// The first cancellation wins: report a lost lock even if a shutdown was requested afterwards.
 	if cause := context.Cause(runCtx); errors.Is(cause, errLockLost) {
 		return cause
@@ -134,6 +123,7 @@ const (
 // safe because the publisher only appends events that directly follow the stream's last one.
 func replicate(
 	ctx context.Context,
+	nc *nats.Conn,
 	js nats.JetStreamContext,
 	progressKV nats.KeyValue,
 	cfg config,
@@ -158,7 +148,9 @@ func replicate(
 		// failure, so the next attempt resumes from whatever the stream now holds.
 		publisher     *publisher
 		lastTimestamp uint64
+		streamCreated time.Time
 		failures      int
+		window        = cfg.maxInFlight()
 	)
 
 	// retryLater waits after a failure that resuming from the stream can get past, backing off while
@@ -187,8 +179,12 @@ func replicate(
 				}
 				continue
 			}
-			lastTimestamp = resumeAt.timestamp
-			publisher = newPublisher(js, cfg, resumeAt.streamSeq)
+			lastTimestamp, streamCreated = resumeAt.timestamp, resumeAt.streamCreated
+			if next := publishWindow(cfg, nc.ConnectedServerVersion()); next != window {
+				log.Printf("publishing up to %d messages at a time (connected to nats-server %s)", next, nc.ConnectedServerVersion())
+				window = next
+			}
+			publisher = newPublisher(js, cfg, resumeAt.streamSeq, window)
 		}
 
 		if err := rateLimiter.wait(ctx); err != nil {
@@ -230,11 +226,25 @@ func replicate(
 
 		// The stream itself records progress. This checkpoint is only read if retention empties the
 		// stream, so a failure here doesn't risk losing or repeating events and need not stop publishing.
-		if err := writeProgress(progressKV, cfg, lastTimestamp, publisher.lastSeq); err != nil {
+		if err := writeProgress(progressKV, cfg, lastTimestamp, publisher.lastSeq, streamCreated); err != nil {
 			log.Printf("warning: %v", err)
 		}
 		log.Printf("published events=%d last_timestamp=%d stream_seq=%d", len(events), lastTimestamp, publisher.lastSeq)
 	}
+}
+
+// publishWindow is how many messages the publisher may have awaiting acknowledgement.
+//
+// Before 2.14, nats-server ignores a failed write while applying a message to a replicated stream, so
+// a message pipelined behind it can take its place and leave a gap. Publishing to a replicated stream
+// is serialised when connected to such a server. The client only sees the version of the server it is
+// connected to, so this runs on every resume (after reconnects), and clusters running mixed versions
+// must use --publish-mode=sync until every server runs 2.14 or later.
+func publishWindow(cfg config, connectedServerVersion string) int {
+	if cfg.streamReplicas > 1 && !serverAtLeast(connectedServerVersion, 2, 14) {
+		return 1
+	}
+	return cfg.maxInFlight()
 }
 
 // serverAtLeast reports whether a nats-server version such as "2.12.15" is at least major.minor.

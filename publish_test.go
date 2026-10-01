@@ -30,15 +30,26 @@ func runUntilPublished(t *testing.T, js nats.JetStreamContext, cfg config, sourc
 	}
 }
 
-// setProgress overwrites the progress checkpoint, as a run that stopped at another point would.
+// setProgress overwrites the progress checkpoint for the current stream, as a run that stopped at
+// another point would.
 func setProgress(t *testing.T, js nats.JetStreamContext, cfg config, timestamp uint64, streamSeq uint64) {
+	t.Helper()
+
+	info, err := js.StreamInfo(cfg.eventStream)
+	if err != nil {
+		t.Fatalf("StreamInfo(): %v", err)
+	}
+	writeCheckpoint(t, js, cfg, progressRecord{Timestamp: timestamp, StreamSeq: streamSeq, StreamCreated: info.Created})
+}
+
+func writeCheckpoint(t *testing.T, js nats.JetStreamContext, cfg config, progress progressRecord) {
 	t.Helper()
 
 	kv, err := js.KeyValue(cfg.progressBucket)
 	if err != nil {
 		t.Fatalf("KeyValue(): %v", err)
 	}
-	if err := writeProgress(kv, cfg, timestamp, streamSeq); err != nil {
+	if err := writeProgress(kv, cfg, progress.Timestamp, progress.StreamSeq, progress.StreamCreated); err != nil {
 		t.Fatalf("writeProgress(): %v", err)
 	}
 }
@@ -153,6 +164,35 @@ func TestRun_RefusesStaleCheckpointWhenRetentionEmptiedStream(t *testing.T) {
 	runUntilPublished(t, js, override, newFakeSource(append(all, testEvent(40))...), []uint64{40})
 }
 
+func TestRun_RefusesCheckpointFromAnEarlierStream(t *testing.T) {
+	t.Parallel()
+	url := startJetStream(t)
+	js := connectJetStream(t, url)
+	cfg := testConfig(t, url)
+
+	runUntilPublished(t, js, cfg, newFakeSource(testEvent(10)), []uint64{10})
+	earlier, _, err := readProgress(js, cfg)
+	if err != nil {
+		t.Fatalf("readProgress(): %v", err)
+	}
+
+	// The stream is recreated and restarted after timestamp 100. Its first event lands at sequence 1,
+	// like event 10 did in the earlier stream. The run crashes before checkpointing, so the earlier
+	// checkpoint remains, and then retention empties the new stream.
+	if err := js.DeleteStream(cfg.eventStream); err != nil {
+		t.Fatalf("DeleteStream(): %v", err)
+	}
+	runUntilPublished(t, js, testConfig(t, url, "--timestamp-last=100"), newFakeSource(testEvent(10), testEvent(110)), []uint64{110})
+	writeCheckpoint(t, js, cfg, earlier)
+	if err := js.PurgeStream(cfg.eventStream); err != nil {
+		t.Fatalf("PurgeStream(): %v", err)
+	}
+
+	// The sequences match, but the checkpoint belongs to the earlier stream: resuming after event 10
+	// would append events consumers already read after event 110.
+	expectRunError(t, cfg, newFakeSource(testEvent(10), testEvent(20), testEvent(110)), "no checkpoint for that sequence of this stream")
+}
+
 func TestRun_TimestampLastAppliesOnlyWithoutAPosition(t *testing.T) {
 	t.Parallel()
 	url := startJetStream(t)
@@ -242,7 +282,7 @@ func TestPublisher_RefusesToLeaveAGap(t *testing.T) {
 
 	// The publisher believes an earlier event was stored at sequence 1, but that message was lost and
 	// the stream is empty. Later events must not be stored after the gap.
-	p := newPublisher(js, cfg, 1)
+	p := newPublisher(js, cfg, 1, cfg.maxInFlight())
 	err := p.publish(context.Background(), []types.ChangeEvent{testEvent(20), testEvent(30)})
 	if err == nil || !strings.Contains(err.Error(), "no longer ends at sequence 1") {
 		t.Fatalf("publish() error = %v, want it to refuse to leave a gap", err)
@@ -353,6 +393,26 @@ func TestIsTransient(t *testing.T) {
 	} {
 		if got := isTransient(fmt.Errorf("wrapped: %w", tc.err)); got != tc.want {
 			t.Errorf("isTransient(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestPublishWindow_SerialisesReplicatedStreamsOnOldServers(t *testing.T) {
+	t.Parallel()
+
+	replicated := config{publishMode: publishModeAsync, publishAsyncMaxPending: 64, streamReplicas: 3}
+	single := config{publishMode: publishModeAsync, publishAsyncMaxPending: 64, streamReplicas: 1}
+	for _, tc := range []struct {
+		cfg     config
+		version string
+		want    int
+	}{
+		{replicated, "2.12.15", 1},
+		{replicated, "2.15.0", 64},
+		{single, "2.12.15", 64},
+	} {
+		if got := publishWindow(tc.cfg, tc.version); got != tc.want {
+			t.Errorf("publishWindow(replicas=%d, %s) = %d, want %d", tc.cfg.streamReplicas, tc.version, got, tc.want)
 		}
 	}
 }

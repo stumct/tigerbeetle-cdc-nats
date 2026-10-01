@@ -32,10 +32,12 @@ type publisher struct {
 	// lastSeq is the stream sequence of the last acknowledged event, or the stream's last sequence
 	// when publishing started.
 	lastSeq uint64
+	// maxInFlight is how many published messages may await acknowledgement at once.
+	maxInFlight int
 }
 
-func newPublisher(js nats.JetStreamContext, cfg config, lastSeq uint64) *publisher {
-	return &publisher{js: js, cfg: cfg, lastSeq: lastSeq}
+func newPublisher(js nats.JetStreamContext, cfg config, lastSeq uint64, maxInFlight int) *publisher {
+	return &publisher{js: js, cfg: cfg, lastSeq: lastSeq, maxInFlight: maxInFlight}
 }
 
 // errUnexpectedAck marks an acknowledgement for a different stream position than the publisher
@@ -52,13 +54,13 @@ type pendingEvent struct {
 }
 
 // publish appends events in order and returns once all of them are acknowledged. At most
-// cfg.maxInFlight() messages are unacknowledged at a time.
+// p.maxInFlight messages are unacknowledged at a time.
 //
 // If a message fails, publish waits for every message still outstanding to resolve before returning
 // the error. The caller then resumes from what the stream holds, and nothing it published earlier is
 // still pending in the client.
 func (p *publisher) publish(ctx context.Context, events []types.ChangeEvent) error {
-	maxInFlight := p.cfg.maxInFlight()
+	maxInFlight := p.maxInFlight
 	inFlight := make([]pendingEvent, 0, min(len(events), maxInFlight))
 	nextSeq := p.lastSeq + 1
 

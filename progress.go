@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -28,11 +29,13 @@ var (
 const maxTailReads = 5
 
 // progressRecord is the checkpoint stored in the progress KV bucket after each published batch:
-// the last published event's timestamp, and the stream sequence it was stored at.
+// the last published event's timestamp, the stream sequence it was stored at, and when that stream
+// was created, which tells a checkpoint for a deleted and recreated stream of the same name apart.
 type progressRecord struct {
-	Timestamp uint64 `json:"timestamp"`
-	StreamSeq uint64 `json:"stream_seq"`
-	Version   string `json:"version"`
+	Timestamp     uint64    `json:"timestamp"`
+	StreamSeq     uint64    `json:"stream_seq"`
+	StreamCreated time.Time `json:"stream_created"`
+	Version       string    `json:"version"`
 }
 
 // position is where publishing resumes: after TigerBeetle timestamp `timestamp`, appending to the
@@ -40,6 +43,8 @@ type progressRecord struct {
 type position struct {
 	timestamp uint64
 	streamSeq uint64
+	// streamCreated identifies the stream incarnation the position belongs to; checkpoints record it.
+	streamCreated time.Time
 }
 
 // recoverPosition decides where publishing resumes. Reads go to the stream leaders, never to
@@ -57,18 +62,19 @@ type position struct {
 // would change the mapping under messages an earlier instance may still have in flight, so it needs
 // a new stream. This also makes the flag safe to leave set.
 func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
-	lastSeq, timestamp, hasEvents, err := readTail(js, cfg)
+	tail, err := readTail(js, cfg)
 	if err != nil {
 		return position{}, err
 	}
+	lastSeq, created := tail.lastSeq, tail.created
 	override := cfg.timestampLast
 
-	if hasEvents {
+	if tail.hasEvents {
 		if override != nil {
 			log.Printf("ignoring --timestamp-last=%d: stream %q already holds events", *override, cfg.eventStream)
 		}
-		log.Printf("resuming after the stream's last event: timestamp=%d stream_seq=%d", timestamp, lastSeq)
-		return position{timestamp: timestamp, streamSeq: lastSeq}, nil
+		log.Printf("resuming after the stream's last event: timestamp=%d stream_seq=%d", tail.timestamp, lastSeq)
+		return position{timestamp: tail.timestamp, streamSeq: lastSeq, streamCreated: created}, nil
 	}
 
 	progress, found, err := readProgress(js, cfg)
@@ -76,7 +82,7 @@ func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
 		return position{}, err
 	}
 
-	if lastSeq > 0 && found && progress.StreamSeq == lastSeq {
+	if lastSeq > 0 && found && progress.StreamSeq == lastSeq && progress.StreamCreated.Equal(created) {
 		if override != nil {
 			log.Printf("ignoring --timestamp-last=%d: stream %q has a checkpoint for its last sequence", *override, cfg.eventStream)
 		}
@@ -86,18 +92,18 @@ func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
 			progress.Timestamp,
 			lastSeq,
 		)
-		return position{timestamp: progress.Timestamp, streamSeq: lastSeq}, nil
+		return position{timestamp: progress.Timestamp, streamSeq: lastSeq, streamCreated: created}, nil
 	}
 
 	if override != nil {
 		log.Printf("stream %q has no position to continue from; starting after --timestamp-last=%d", cfg.eventStream, *override)
-		return position{timestamp: *override, streamSeq: lastSeq}, nil
+		return position{timestamp: *override, streamSeq: lastSeq, streamCreated: created}, nil
 	}
 
 	switch {
 	case lastSeq == 0 && !found:
 		log.Printf("stream %q is new and no progress exists; publishing from the beginning", cfg.eventStream)
-		return position{}, nil
+		return position{streamCreated: created}, nil
 
 	case lastSeq == 0:
 		return position{}, fmt.Errorf(
@@ -113,8 +119,8 @@ func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
 	default:
 		return position{}, fmt.Errorf(
 			"%w: stream %q holds no events (retention removed them) and ends at sequence %d, but %q has no "+
-				"checkpoint for that sequence, so the events that followed it are unknown. Set --timestamp-last "+
-				"to the timestamp of the last event consumers received",
+				"checkpoint for that sequence of this stream, so the events that followed it are unknown. Set "+
+				"--timestamp-last to the timestamp of the last event consumers received",
 			errCannotResume,
 			cfg.eventStream,
 			lastSeq,
@@ -123,41 +129,55 @@ func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
 	}
 }
 
-// readTail returns the stream's last sequence and, if the stream holds events, the timestamp of the
-// event at that sequence.
-func readTail(js nats.JetStreamContext, cfg config) (lastSeq uint64, timestamp uint64, hasEvents bool, err error) {
+// streamTail is the state of the event stream that publishing resumes from.
+type streamTail struct {
+	lastSeq uint64
+	created time.Time
+	// hasEvents is set when the stream holds events; timestamp is then the last event's.
+	hasEvents bool
+	timestamp uint64
+}
+
+// readTail reads the stream's state and, if it holds events, the timestamp of the event at its last
+// sequence.
+func readTail(js nats.JetStreamContext, cfg config) (streamTail, error) {
 	var previousLastSeq uint64
 	for attempt := range maxTailReads {
 		info, err := js.StreamInfo(cfg.eventStream)
 		if err != nil {
-			return 0, 0, false, fmt.Errorf("read stream %q state: %w", cfg.eventStream, err)
+			return streamTail{}, fmt.Errorf("read stream %q state: %w", cfg.eventStream, err)
 		}
-		lastSeq = info.State.LastSeq
+		tail := streamTail{lastSeq: info.State.LastSeq, created: info.Created}
 		if info.State.Msgs == 0 {
-			return lastSeq, 0, false, nil
+			return tail, nil
 		}
 
-		timestamp, err = lastEventTimestamp(js, cfg, lastSeq)
+		timestamp, err := lastEventTimestamp(js, cfg, tail.lastSeq)
 		if !errors.Is(err, errTailMissing) {
-			return lastSeq, timestamp, err == nil, err
+			if err != nil {
+				return streamTail{}, err
+			}
+			tail.hasEvents, tail.timestamp = true, timestamp
+			return tail, nil
 		}
 
 		// The last message vanished after StreamInfo. Retention removes the oldest messages first, so
 		// if it removed this one, the stream is now empty or has grown. If neither happened, it was
 		// deleted while earlier events remain, and only an operator can tell which events consumers
 		// still need.
-		if attempt > 0 && lastSeq == previousLastSeq {
-			return 0, 0, false, fmt.Errorf(
+		if attempt > 0 && tail.lastSeq == previousLastSeq {
+			return streamTail{}, fmt.Errorf(
 				"%w: the message at stream %q's last sequence %d was deleted while earlier events remain, so the "+
-					"publisher can't tell where to resume; restore it, or purge the stream and set --timestamp-last",
+					"publisher can't tell where to resume; restore it, or delete and recreate the stream and set "+
+					"--timestamp-last",
 				errCannotResume,
 				cfg.eventStream,
-				lastSeq,
+				tail.lastSeq,
 			)
 		}
-		previousLastSeq = lastSeq
+		previousLastSeq = tail.lastSeq
 	}
-	return 0, 0, false, fmt.Errorf("%w: stream %q", errTailMoving, cfg.eventStream)
+	return streamTail{}, fmt.Errorf("%w: stream %q", errTailMoving, cfg.eventStream)
 }
 
 // lastEventTimestamp returns the TigerBeetle timestamp of the event at the stream's last sequence,
@@ -222,20 +242,31 @@ func readProgress(js nats.JetStreamContext, cfg config) (progressRecord, bool, e
 	}
 
 	var stored struct {
-		Timestamp *uint64 `json:"timestamp"`
-		StreamSeq uint64  `json:"stream_seq"`
-		Version   string  `json:"version"`
+		Timestamp     *uint64   `json:"timestamp"`
+		StreamSeq     uint64    `json:"stream_seq"`
+		StreamCreated time.Time `json:"stream_created"`
+		Version       string    `json:"version"`
 	}
 	if err := json.Unmarshal(msg.Data, &stored); err != nil || stored.Timestamp == nil {
 		return progressRecord{}, false, fmt.Errorf("%w: invalid progress checkpoint in %q: %q", errCannotResume, cfg.progressKey(), msg.Data)
 	}
-	return progressRecord{Timestamp: *stored.Timestamp, StreamSeq: stored.StreamSeq, Version: stored.Version}, true, nil
+	return progressRecord{
+		Timestamp:     *stored.Timestamp,
+		StreamSeq:     stored.StreamSeq,
+		StreamCreated: stored.StreamCreated,
+		Version:       stored.Version,
+	}, true, nil
 }
 
-// writeProgress records the last published event's timestamp and stream sequence in the progress
-// KV bucket.
-func writeProgress(kv nats.KeyValue, cfg config, timestamp uint64, streamSeq uint64) error {
-	payload, err := json.Marshal(progressRecord{Timestamp: timestamp, StreamSeq: streamSeq, Version: cfg.version})
+// writeProgress records the last published event's timestamp and stream sequence, and the stream's
+// creation time, in the progress KV bucket.
+func writeProgress(kv nats.KeyValue, cfg config, timestamp uint64, streamSeq uint64, streamCreated time.Time) error {
+	payload, err := json.Marshal(progressRecord{
+		Timestamp:     timestamp,
+		StreamSeq:     streamSeq,
+		StreamCreated: streamCreated,
+		Version:       cfg.version,
+	})
 	if err != nil {
 		return fmt.Errorf("marshal progress: %w", err)
 	}
