@@ -496,14 +496,18 @@ func clusterScopedResourceName(base string, clusterID string) string {
 }
 
 // validateLiteralSubject checks that subject is a NATS subject without wildcards: dot-separated,
-// non-empty tokens with no whitespace, '*' or '>'.
+// non-empty tokens with no whitespace, none of which is '*' or '>'. Those characters are wildcards
+// only as a whole token, so "foo*bar" is a valid literal token.
 func validateLiteralSubject(subject string) error {
+	if strings.ContainsAny(subject, " \t\r\n\f") {
+		return fmt.Errorf("%q must not contain whitespace", subject)
+	}
 	for _, token := range strings.Split(subject, ".") {
-		if token == "" {
+		switch token {
+		case "":
 			return fmt.Errorf("%q has an empty token", subject)
-		}
-		if strings.ContainsAny(token, " \t\r\n\f*>") {
-			return fmt.Errorf("%q must not contain whitespace or wildcards ('*', '>')", subject)
+		case "*", ">":
+			return fmt.Errorf("%q must not contain wildcard tokens ('*', '>')", subject)
 		}
 	}
 	return nil

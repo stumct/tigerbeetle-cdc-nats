@@ -1,8 +1,10 @@
 package cdcnats
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
 
 	"github.com/nats-io/nats.go"
@@ -19,7 +21,8 @@ func connectNATS(cfg config) (*nats.Conn, error) {
 			}
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			log.Printf("reconnected to NATS at %s", nc.ConnectedUrlRedacted())
+			// ConnectedUrlRedacted masks passwords but not tokens.
+			log.Printf("reconnected to NATS at %s", redactURLs(nc.ConnectedUrl()))
 		}),
 	}
 
@@ -45,6 +48,11 @@ func connectNATS(cfg config) (*nats.Conn, error) {
 
 	nc, err := nats.Connect(cfg.natsURL, options...)
 	if err != nil {
+		// A URL parse error quotes the whole URL, credentials included. Keep only the reason.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = fmt.Errorf("invalid URL: %w", urlErr.Err)
+		}
 		return nil, fmt.Errorf("connect to NATS at %s: %w", redactURLs(cfg.natsURL), err)
 	}
 	return nc, nil

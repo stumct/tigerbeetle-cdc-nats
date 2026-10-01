@@ -214,7 +214,7 @@ Subject routing:
 - `SIGINT`/`SIGTERM` stop the publisher, even while TigerBeetle is unreachable, release the lock and exit 0. A second signal exits immediately.
 - The lock bucket must have TTL enabled, and the progress bucket must have TTL disabled.
 - Stream and KV configuration mismatches fail fast with actionable error messages. This includes message-count limits on the event stream and non-`limits` retention on the KV buckets, both of which can lose data silently.
-- Flags are validated before connecting: subjects must be literal (no `*`/`>` or empty tokens), stream and bucket names must follow JetStream's naming rules, and `--dedupe-window` must not exceed a non-zero `--stream-max-age`.
+- Flags are validated before connecting: subjects must be literal (no `*` or `>` tokens, no empty tokens), stream and bucket names must follow JetStream's naming rules, and `--dedupe-window` must not exceed a non-zero `--stream-max-age`.
 
 ## Testing
 

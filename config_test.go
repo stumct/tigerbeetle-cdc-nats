@@ -140,6 +140,27 @@ func TestParseConfig_RejectsInvalidCombinations(t *testing.T) {
 	}
 }
 
+func TestValidateLiteralSubject_AllowsWildcardCharactersInsideTokens(t *testing.T) {
+	t.Parallel()
+
+	for _, subject := range []string{"foo*bar", "a.b>c.d", "tigerbeetle.cdc"} {
+		if err := validateLiteralSubject(subject); err != nil {
+			t.Errorf("validateLiteralSubject(%q) error = %v, want nil", subject, err)
+		}
+	}
+}
+
+func TestConnectNATS_KeepsCredentialsOutOfURLErrors(t *testing.T) {
+	t.Parallel()
+
+	for _, natsURL := range []string{"nats://alice:s3cret@host:badport", "nats://s3cret@host:badport"} {
+		_, err := connectNATS(config{natsURL: natsURL})
+		if err == nil || strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("connectNATS(%q) error = %v, want an error without the credential", natsURL, err)
+		}
+	}
+}
+
 func TestParseConfig_AcceptsDedupeWindowWithinMaxAge(t *testing.T) {
 	t.Parallel()
 
