@@ -90,9 +90,12 @@ Headers include:
 
 ## Upgrading from v0.1.x
 
-- Default subjects now include the cluster ID (`tigerbeetle.cdc.<cluster>.<ledger>.<event_type>`). An existing stream fails the startup config check. To keep the old subjects, pass `--subject-prefix=tigerbeetle.cdc` (or `--subject=tigerbeetle.cdc` in single mode). To move to the new ones, run once with `--stream-update` and update consumers' subject filters.
-- Publishing resumes from the stream's last event, not the KV checkpoint. No migration is needed.
-- `--timestamp-last` only moves the start forward and is safe to leave set. `--progress-every-events` is accepted but has no effect.
+- Default subjects now include the cluster ID (`tigerbeetle.cdc.<cluster>.<ledger>.<event_type>`). With default flags, an existing stream fails the startup subject check. Either:
+  - keep the old subjects with `--subject-prefix=tigerbeetle.cdc` (or `--subject=tigerbeetle.cdc` in single mode), or
+  - start the new version with `--stream-update`. It updates the stream's subjects only once it holds the lock, so an old instance keeps publishing until you stop it. Events already stored keep their old subjects.
+- Before moving consumers to the new subjects, make sure their filters still match the old ones until they have consumed the stored backlog. A filter of `tigerbeetle.cdc.>` matches both formats. Switching straight to `tigerbeetle.cdc.<cluster>.>` skips unread events stored under old subjects.
+- Publishing resumes from the stream's last event, not the KV checkpoint. No migration is needed. Checkpoints written by v0.1.x lack the stream sequence, so if retention empties the stream before the new version writes its first checkpoint, the publisher asks for `--timestamp-last`.
+- `--timestamp-last` only moves the start forward in a stream that holds events, so it's safe to leave set. `--progress-every-events` is accepted but has no effect.
 - A second instance now waits for the lock instead of exiting.
 - An existing stream with `max_msgs` or `max_msgs_per_subject` limits fails the config check, because those limits silently drop events. Run with `--stream-update` to clear them.
 - Nothing else may publish to the event stream.

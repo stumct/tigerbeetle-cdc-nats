@@ -169,3 +169,28 @@ func TestRun_ClustersShareANATSAccountWithDefaultSubjects(t *testing.T) {
 	awaitStream(t, js, first.eventStream, []uint64{10})
 	awaitStream(t, js, second.eventStream, []uint64{20})
 }
+
+func TestRun_UpgradesStreamToClusterScopedSubjects(t *testing.T) {
+	t.Parallel()
+	url := startJetStream(t)
+	js := connectJetStream(t, url)
+
+	// A stream written with the v0.1.x default subjects.
+	legacy := testConfig(t, url, "--subject-prefix=tigerbeetle.cdc")
+	runUntilPublished(t, js, legacy, newFakeSource(testEvent(10), testEvent(20)), []uint64{10, 20})
+
+	// The new defaults fail the subject check until the stream is updated.
+	cfg := testConfig(t, url)
+	expectRunError(t, cfg, newFakeSource(), "subjects")
+
+	upgrade := testConfig(t, url, "--stream-update")
+	runUntilPublished(t, js, upgrade, newFakeSource(testEvent(10), testEvent(20), testEvent(30)), []uint64{10, 20, 30})
+
+	last, err := js.GetMsg(cfg.eventStream, 3)
+	if err != nil {
+		t.Fatalf("GetMsg(): %v", err)
+	}
+	if want := "tigerbeetle.cdc.7.1.single_phase"; last.Subject != want {
+		t.Fatalf("subject after upgrade = %q, want %q", last.Subject, want)
+	}
+}
