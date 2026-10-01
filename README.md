@@ -57,7 +57,7 @@ nats --server nats://127.0.0.1:4222 sub 'tigerbeetle.cdc.>'
 The event stream is an ordered copy of the cluster's change events:
 
 - Events appear in TigerBeetle timestamp order, each at most once, with no gaps.
-- Every message names the event before it: its stream sequence (`Nats-Expected-Last-Sequence`) and, within a batch, its message ID (`Nats-Expected-Last-Msg-Id`). JetStream stores a message only if the stream ends with exactly that event. So a lost or rejected message, a stream leader change mid-batch, a late message from an earlier attempt, or a second writer cannot leave a gap or reorder events.
+- Every message carries `Nats-Expected-Last-Sequence`, the stream sequence of the event before it, and publishing always starts from a position read back from the stream. JetStream stores a message only if the stream ends at that sequence. So a lost or rejected message, a stream leader change mid-batch, a late message from an earlier attempt, or a second instance of the publisher cannot leave a gap or reorder events.
 - After a failure, and on every start, publishing resumes after the message at the stream's last sequence, read from the stream leader. Crashing between publishing and checkpointing therefore doesn't republish anything, however long the restart takes.
 - Lost responses, leader elections, reconnects and rejected messages are retried in-process with backoff. Failures that need an operator, such as a message over the stream's size limit or a sealed stream, stop the publisher.
 - The KV progress checkpoint records the last event's timestamp and stream sequence. It is a fallback, used only when retention has removed every event from the stream, and only if it matches the stream's last sequence. Otherwise the publisher stops and asks for `--timestamp-last`.
@@ -65,7 +65,7 @@ The event stream is an ordered copy of the cluster's change events:
 
 Requirements:
 
-- One stream per TigerBeetle cluster, and nothing else may publish to it. The publisher stops if the stream's last message isn't one of its events.
+- One stream per TigerBeetle cluster, with the publisher as its only writer. A foreign message that lands while a batch is in flight can take the position the next event expects and let it through, skipping the event before it. Enforce this with NATS permissions: allow only the publisher's user to publish to the stream's subjects (for example `tigerbeetle.cdc.<cluster>.>`). The publisher also refuses to resume if the stream's last message isn't one of its events.
 - Durable JetStream storage. NATS acknowledges a write before flushing it to disk, so on a single server a crash or power cut can lose acknowledged events. The publisher republishes them, but consumers may already have seen them. For financial data, use `--stream-replicas=3` on a NATS cluster, or `sync_interval: always` on a single server.
 - If the stream is deleted and recreated, the publisher refuses to resume into it, because earlier events would be missing. Start it with `--timestamp-last=0` to republish everything, or a later timestamp to start there.
 

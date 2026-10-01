@@ -12,16 +12,20 @@ import (
 
 // publisher appends change events to the event stream strictly in order.
 //
-// Every message names its predecessor, and JetStream stores it only if the stream ends with exactly
-// that message. Nats-Expected-Last-Sequence requires the predecessor's position. Within a batch,
-// Nats-Expected-Last-Msg-Id also requires its identity, so a message that lands where the
-// predecessor should be (from another writer, or one of ours that timed out earlier) can't let a
-// later message through. The first message of a batch follows an event already confirmed by its
-// acknowledgement or by reading it back, so its position identifies it.
+// Every message carries Nats-Expected-Last-Sequence set to its predecessor's stream sequence, and
+// JetStream stores it only if the stream ends at that sequence. Publishing always starts from a
+// position read back from the stream (an event and the sequence it is stored at) and appends events
+// densely in TigerBeetle order, so the event at each stream position is fixed. A message that passes
+// its sequence check therefore directly follows the right event, even if it is a late message from an
+// abandoned attempt or another instance. If a message is lost or rejected, every message pipelined
+// after it is rejected too; the publish fails instead of leaving a gap, a duplicate or a reordering,
+// and the caller resumes from the stream (see recoverPosition).
 //
-// If a message is lost or rejected, every message pipelined after it is rejected too. The publish
-// fails instead of leaving a gap, a duplicate or a reordering, and the caller resumes from the
-// stream's last event (see recoverPosition).
+// That reasoning needs every writer to be a publisher like this one: a foreign message landing at the
+// position a pipelined message expects would let it through. Nats-Expected-Last-Msg-Id would catch
+// that, but nats-server 2.14+ treats a failed message-ID check on a replicated stream as a critical
+// write error and takes the stream's replicas out of service, so it isn't used. Deployments must
+// make the publisher the stream's only writer (see the README).
 type publisher struct {
 	js  nats.JetStreamContext
 	cfg config
@@ -58,7 +62,7 @@ func (p *publisher) publish(ctx context.Context, events []types.ChangeEvent) err
 	inFlight := make([]pendingEvent, 0, min(len(events), maxInFlight))
 	nextSeq := p.lastSeq + 1
 
-	for i, event := range events {
+	for _, event := range events {
 		if len(inFlight) == maxInFlight {
 			if err := p.await(ctx, inFlight[0]); err != nil {
 				return settle(ctx, inFlight[1:], err)
@@ -72,9 +76,6 @@ func (p *publisher) publish(ctx context.Context, events []types.ChangeEvent) err
 		}
 		msg.Header.Set(nats.ExpectedStreamHdr, p.cfg.eventStream)
 		msg.Header.Set(nats.ExpectedLastSeqHdr, strconv.FormatUint(nextSeq-1, 10))
-		if i > 0 {
-			msg.Header.Set(nats.ExpectedLastMsgIdHdr, eventMsgID(p.cfg.clusterIDDecimal, events[i-1].Timestamp))
-		}
 
 		future, err := p.js.PublishMsgAsync(msg)
 		if err != nil {
@@ -110,9 +111,9 @@ func (p *publisher) await(ctx context.Context, pending pendingEvent) error {
 		if err == nil {
 			err = fmt.Errorf("async publish failed without error details")
 		}
-		if isFenceRejection(err) {
-			err = fmt.Errorf("stream %q no longer ends with the event before this one at sequence %d, because an "+
-				"earlier message was lost or another message was appended: %w", p.cfg.eventStream, pending.sequence-1, err)
+		if isWrongLastSequence(err) {
+			err = fmt.Errorf("stream %q no longer ends at sequence %d, because an earlier message was lost or "+
+				"another message was appended: %w", p.cfg.eventStream, pending.sequence-1, err)
 		}
 		return fmt.Errorf("publish event timestamp=%d subject=%q: %w", pending.timestamp, pending.subject, err)
 	case ack = <-pending.future.Ok():
@@ -170,23 +171,17 @@ func buildEventMessage(cfg config, event types.ChangeEvent) (*nats.Msg, error) {
 	return msg, nil
 }
 
-// jsErrCodeStreamWrongLastMsgID is JetStream's error code for a failed Nats-Expected-Last-Msg-Id
-// check. nats.go doesn't name it.
-const jsErrCodeStreamWrongLastMsgID nats.ErrorCode = 10070
-
-// isFenceRejection reports whether JetStream rejected a message because the stream doesn't end with
-// the predecessor the message named.
-func isFenceRejection(err error) bool {
-	var apiErr *nats.APIError
-	return isWrongLastSequence(err) || (errors.As(err, &apiErr) && apiErr.ErrorCode == jsErrCodeStreamWrongLastMsgID)
-}
+// jsErrCodeDuplicateMessageInProcess is JetStream's error code for a message whose Nats-Msg-Id
+// matches one still being replicated, for example an earlier attempt whose acknowledgement timed out.
+// nats.go doesn't name it.
+const jsErrCodeDuplicateMessageInProcess nats.ErrorCode = 10158
 
 // isTransient reports whether a publish or resume failure is one that resuming from the stream can
-// get past: a lost or late response, a leader election, a reconnect, or a fence rejection caused by
-// a message that landed unexpectedly. Anything else, such as an encoding error, a sealed stream or a
-// message over the stream's size limit, needs an operator, so the run stops instead of retrying.
+// get past: a lost or late response, a leader election, a reconnect, or a sequence check failing
+// because a message landed unexpectedly. Anything else, such as an encoding error, a sealed stream or
+// a message over the stream's size limit, needs an operator, so the run stops instead of retrying.
 func isTransient(err error) bool {
-	if isFenceRejection(err) || errors.Is(err, errUnexpectedAck) {
+	if isWrongLastSequence(err) || errors.Is(err, errUnexpectedAck) {
 		return true
 	}
 
@@ -198,6 +193,7 @@ func isTransient(err error) bool {
 		nats.ErrNoStreamResponse,
 		nats.ErrDisconnected,
 		nats.ErrConnectionReconnecting,
+		nats.ErrReconnectBufExceeded,
 	} {
 		if errors.Is(err, transient) {
 			return true
@@ -206,5 +202,5 @@ func isTransient(err error) bool {
 
 	// 503: JetStream is temporarily unavailable, for example while a stream elects a leader.
 	var apiErr *nats.APIError
-	return errors.As(err, &apiErr) && apiErr.Code == 503
+	return errors.As(err, &apiErr) && (apiErr.Code == 503 || apiErr.ErrorCode == jsErrCodeDuplicateMessageInProcess)
 }

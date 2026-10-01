@@ -237,7 +237,7 @@ func TestPublisher_RefusesToLeaveAGap(t *testing.T) {
 	// the stream is empty. Later events must not be stored after the gap.
 	p := newPublisher(js, cfg, 1)
 	err := p.publish(context.Background(), []types.ChangeEvent{testEvent(20), testEvent(30)})
-	if err == nil || !strings.Contains(err.Error(), "no longer ends with the event before this one") {
+	if err == nil || !strings.Contains(err.Error(), "no longer ends at sequence 1") {
 		t.Fatalf("publish() error = %v, want it to refuse to leave a gap", err)
 	}
 
@@ -250,40 +250,21 @@ func TestPublisher_RefusesToLeaveAGap(t *testing.T) {
 	}
 }
 
-func TestPublisher_RefusesToFollowAnotherWritersMessage(t *testing.T) {
+func TestRun_RefusesToResumeAfterTheLastEventWasDeleted(t *testing.T) {
 	t.Parallel()
 	url := startJetStream(t)
 	js := connectJetStream(t, url)
-	cfg := testConfig(t, url)
-	if err := ensureEventStream(js, cfg, false); err != nil {
-		t.Fatalf("ensureEventStream(): %v", err)
+	cfg := testConfig(t, url, "--timestamp-last=0")
+
+	events := []types.ChangeEvent{testEvent(10), testEvent(20)}
+	runUntilPublished(t, js, cfg, newFakeSource(events...), []uint64{10, 20})
+	if err := js.DeleteMsg(cfg.eventStream, 2); err != nil {
+		t.Fatalf("DeleteMsg(): %v", err)
 	}
 
-	// The publisher read the stream when it ended with event 10 at sequence 1. Before its batch
-	// arrives, another message lands at sequence 2.
-	p := newPublisher(js, cfg, 0)
-	if err := p.publish(context.Background(), []types.ChangeEvent{testEvent(10)}); err != nil {
-		t.Fatalf("publish(10): %v", err)
-	}
-	if _, err := js.Publish(cfg.subjectForEvent(1, "single_phase"), []byte("{}")); err != nil {
-		t.Fatalf("Publish(): %v", err)
-	}
-
-	// Event 20 expects sequence 1 and is rejected. Event 30 expects sequence 2, which the foreign
-	// message occupies: only the predecessor's message ID stops event 30 from being stored after it,
-	// which would skip event 20 for good.
-	err := p.publish(context.Background(), []types.ChangeEvent{testEvent(20), testEvent(30)})
-	if err == nil {
-		t.Fatalf("publish(20, 30) error = nil, want a fence rejection")
-	}
-
-	info, err := js.StreamInfo(cfg.eventStream)
-	if err != nil {
-		t.Fatalf("StreamInfo(): %v", err)
-	}
-	if info.State.Msgs != 2 {
-		t.Fatalf("stream messages = %d, want 2 (event 10 and the foreign message)", info.State.Msgs)
-	}
+	// Resuming after event 10 would republish event 20, and a leftover --timestamp-last=0 would
+	// republish both. Neither is safe without knowing what consumers received.
+	expectRunError(t, cfg, newFakeSource(events...), "was deleted")
 }
 
 func TestRun_PublishesInOrderOnReplicatedStream(t *testing.T) {

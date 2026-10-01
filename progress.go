@@ -15,6 +15,9 @@ import (
 // corrupt the stream. Retrying won't help: an operator has to decide.
 var errCannotResume = errors.New("cannot resume publishing")
 
+// errTailMissing reports that the message at the stream's last sequence no longer exists.
+var errTailMissing = errors.New("the stream's last message no longer exists")
+
 // progressRecord is the checkpoint stored in the progress KV bucket after each published batch:
 // the last published event's timestamp, and the stream sequence it was stored at.
 type progressRecord struct {
@@ -44,23 +47,13 @@ type position struct {
 // only moves the start forward, because going back would duplicate and reorder events. In a stream
 // without events it is the operator's choice, and wins over the checkpoint.
 func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
-	info, err := js.StreamInfo(cfg.eventStream)
+	lastSeq, timestamp, hasEvents, err := readTail(js, cfg)
 	if err != nil {
-		return position{}, fmt.Errorf("read stream %q state: %w", cfg.eventStream, err)
+		return position{}, err
 	}
-	lastSeq := info.State.LastSeq
 	override := cfg.timestampLast
 
-	if info.State.Msgs > 0 {
-		timestamp, err := lastEventTimestamp(js, cfg, lastSeq)
-		if errors.Is(err, errCannotResume) && override != nil {
-			log.Printf("%v; starting after --timestamp-last=%d instead", err, *override)
-			return position{timestamp: *override, streamSeq: lastSeq}, nil
-		}
-		if err != nil {
-			return position{}, err
-		}
-
+	if hasEvents {
 		switch {
 		case override != nil && *override > timestamp:
 			log.Printf("starting after --timestamp-last=%d, past the stream's last event (timestamp %d)", *override, timestamp)
@@ -120,20 +113,46 @@ func recoverPosition(js nats.JetStreamContext, cfg config) (position, error) {
 	}
 }
 
+// readTail returns the stream's last sequence and, if the stream holds events, the timestamp of the
+// event at that sequence.
+func readTail(js nats.JetStreamContext, cfg config) (lastSeq uint64, timestamp uint64, hasEvents bool, err error) {
+	for attempt := 0; ; attempt++ {
+		info, err := js.StreamInfo(cfg.eventStream)
+		if err != nil {
+			return 0, 0, false, fmt.Errorf("read stream %q state: %w", cfg.eventStream, err)
+		}
+		lastSeq = info.State.LastSeq
+		if info.State.Msgs == 0 {
+			return lastSeq, 0, false, nil
+		}
+
+		timestamp, err = lastEventTimestamp(js, cfg, lastSeq)
+		if !errors.Is(err, errTailMissing) {
+			return lastSeq, timestamp, err == nil, err
+		}
+
+		// Retention may have removed the last event since StreamInfo, so read the state again. If
+		// events remain but the last one is still missing, it was deleted, and only an operator can
+		// tell which events consumers still need.
+		if attempt > 0 {
+			return 0, 0, false, fmt.Errorf(
+				"%w: the message at stream %q's last sequence %d was deleted while earlier events remain, so the "+
+					"publisher can't tell where to resume; restore it, or purge the stream and set --timestamp-last",
+				errCannotResume,
+				cfg.eventStream,
+				lastSeq,
+			)
+		}
+	}
+}
+
 // lastEventTimestamp returns the TigerBeetle timestamp of the event at the stream's last sequence,
 // from its Nats-Msg-Id. Reading by sequence, not subject, keeps the timestamp and sequence of the
 // resume position paired, and works whatever subjects older events were published on.
 func lastEventTimestamp(js nats.JetStreamContext, cfg config, lastSeq uint64) (uint64, error) {
 	msg, err := js.GetMsg(cfg.eventStream, lastSeq)
 	if errors.Is(err, nats.ErrMsgNotFound) {
-		return 0, fmt.Errorf(
-			"%w: the message at stream %q's last sequence %d no longer exists (it was deleted, or retention "+
-				"just removed it); restart to resume from the checkpoint, or set --timestamp-last to the "+
-				"timestamp of the last event consumers received",
-			errCannotResume,
-			cfg.eventStream,
-			lastSeq,
-		)
+		return 0, fmt.Errorf("%w: stream %q sequence %d", errTailMissing, cfg.eventStream, lastSeq)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("read the last event in stream %q: %w", cfg.eventStream, err)
