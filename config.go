@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -48,7 +49,17 @@ const (
 	defaultProgressEveryEvents       = uint32(0)
 	maxJetStreamReplicaCount         = 5
 	defaultStreamMaxBytes      int64 = -1
+	// minDedupeWindow is the smallest duplicate window JetStream accepts.
+	minDedupeWindow = 100 * time.Millisecond
+	// maxJetStreamNameLength is the longest stream name JetStream accepts.
+	maxJetStreamNameLength = 255
+	// maxTigerBeetleTimestamp is the largest TigerBeetle timestamp. Timestamps are u63: the top bit is
+	// reserved.
+	maxTigerBeetleTimestamp uint64 = math.MaxInt64
 )
+
+// bucketNamePattern is the KV bucket naming rule enforced by nats.go.
+var bucketNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 type optionalUint64Flag struct {
 	value uint64
@@ -100,6 +111,12 @@ type config struct {
 	addresses        []string
 
 	natsURL string
+	// Optional NATS authentication and TLS files. nats.go reads them when connecting.
+	natsCredsFile   string
+	natsNKeyFile    string
+	natsTLSCAFile   string
+	natsTLSCertFile string
+	natsTLSKeyFile  string
 
 	eventStream    string
 	streamReplicas int
@@ -181,7 +198,12 @@ func parseConfig(args []string, version string) (config, error) {
 	fs.StringVar(&clusterRaw, "cluster-id", "", "TigerBeetle cluster ID (u128 decimal)")
 	fs.StringVar(&addressesRaw, "addresses", "", "TigerBeetle replica addresses (comma-separated)")
 
-	fs.StringVar(&cfg.natsURL, "nats-url", defaultNATSURL, "NATS server URL")
+	fs.StringVar(&cfg.natsURL, "nats-url", defaultNATSURL, "NATS server URL (comma-separated for multiple servers)")
+	fs.StringVar(&cfg.natsCredsFile, "nats-creds", "", "NATS credentials file (user JWT and NKey seed)")
+	fs.StringVar(&cfg.natsNKeyFile, "nats-nkey", "", "NATS NKey seed file")
+	fs.StringVar(&cfg.natsTLSCAFile, "nats-tls-ca", "", "CA certificate file used to verify the NATS server (enables TLS)")
+	fs.StringVar(&cfg.natsTLSCertFile, "nats-tls-cert", "", "Client certificate file for NATS mutual TLS (requires --nats-tls-key)")
+	fs.StringVar(&cfg.natsTLSKeyFile, "nats-tls-key", "", "Client private key file for NATS mutual TLS (requires --nats-tls-cert)")
 
 	fs.StringVar(&cfg.eventStream, "stream", "", "JetStream stream for CDC events (default: TB_CDC_EVENTS_<cluster>)")
 	fs.IntVar(&cfg.streamReplicas, "stream-replicas", defaultStreamReplicas, "JetStream stream replica count (1-5)")
@@ -274,8 +296,16 @@ func parseConfig(args []string, version string) (config, error) {
 		return config{}, fmt.Errorf("--lock-refresh must be less than --lock-ttl")
 	}
 
-	if cfg.dedupeWindow <= 0 {
-		return config{}, fmt.Errorf("--dedupe-window must be greater than zero")
+	if cfg.dedupeWindow < minDedupeWindow {
+		return config{}, fmt.Errorf("--dedupe-window must be at least %s", minDedupeWindow)
+	}
+
+	if cfg.streamMaxAge > 0 && cfg.dedupeWindow > cfg.streamMaxAge {
+		return config{}, fmt.Errorf(
+			"--dedupe-window (%s) must not exceed --stream-max-age (%s)",
+			cfg.dedupeWindow,
+			cfg.streamMaxAge,
+		)
 	}
 
 	if cfg.publishAckTimeout <= 0 {
@@ -297,10 +327,16 @@ func parseConfig(args []string, version string) (config, error) {
 		if cfg.subjectPrefix == "" {
 			return config{}, fmt.Errorf("--subject-prefix cannot be empty in structured mode")
 		}
+		if err := validateLiteralSubject(cfg.subjectPrefix); err != nil {
+			return config{}, fmt.Errorf("invalid --subject-prefix: %w", err)
+		}
 	case subjectModeSingle:
 		cfg.singleSubject = strings.TrimSpace(cfg.singleSubject)
 		if cfg.singleSubject == "" {
 			return config{}, fmt.Errorf("--subject cannot be empty in single mode")
+		}
+		if err := validateLiteralSubject(cfg.singleSubject); err != nil {
+			return config{}, fmt.Errorf("invalid --subject: %w", err)
 		}
 	default:
 		return config{}, fmt.Errorf("--subject-mode must be one of: structured, single")
@@ -327,6 +363,14 @@ func parseConfig(args []string, version string) (config, error) {
 		return config{}, fmt.Errorf("--nats-url cannot be empty")
 	}
 
+	if cfg.natsCredsFile != "" && cfg.natsNKeyFile != "" {
+		return config{}, fmt.Errorf("--nats-creds and --nats-nkey cannot be used together")
+	}
+
+	if (cfg.natsTLSCertFile == "") != (cfg.natsTLSKeyFile == "") {
+		return config{}, fmt.Errorf("--nats-tls-cert and --nats-tls-key must be set together")
+	}
+
 	cfg.eventStream = strings.TrimSpace(cfg.eventStream)
 	if cfg.eventStream == "" {
 		cfg.eventStream = clusterScopedResourceName(defaultEventStreamBase, clusterIDDecimal)
@@ -340,6 +384,22 @@ func parseConfig(args []string, version string) (config, error) {
 	cfg.lockBucket = strings.TrimSpace(cfg.lockBucket)
 	if cfg.lockBucket == "" {
 		cfg.lockBucket = clusterScopedResourceName(defaultLockBucketBase, clusterIDDecimal)
+	}
+
+	if err := validateStreamName(cfg.eventStream); err != nil {
+		return config{}, fmt.Errorf("invalid --stream: %w", err)
+	}
+
+	if err := validateBucketName(cfg.progressBucket); err != nil {
+		return config{}, fmt.Errorf("invalid --progress-bucket: %w", err)
+	}
+
+	if err := validateBucketName(cfg.lockBucket); err != nil {
+		return config{}, fmt.Errorf("invalid --lock-bucket: %w", err)
+	}
+
+	if cfg.progressBucket == cfg.lockBucket {
+		return config{}, fmt.Errorf("--progress-bucket and --lock-bucket must differ")
 	}
 
 	if requestsPerSecondLimit.set && requestsPerSecondLimit.value == 0 {
@@ -363,6 +423,9 @@ func parseConfig(args []string, version string) (config, error) {
 	}
 
 	if timestampLast.set {
+		if timestampLast.value >= maxTigerBeetleTimestamp {
+			return config{}, fmt.Errorf("--timestamp-last must be less than %d (the largest TigerBeetle timestamp)", maxTigerBeetleTimestamp)
+		}
 		value := timestampLast.value
 		cfg.timestampLast = &value
 	}
@@ -430,4 +493,37 @@ func storageTypeLabel(storage nats.StorageType) string {
 
 func clusterScopedResourceName(base string, clusterID string) string {
 	return base + "_" + clusterID
+}
+
+// validateLiteralSubject checks that subject is a NATS subject without wildcards: dot-separated,
+// non-empty tokens with no whitespace, '*' or '>'.
+func validateLiteralSubject(subject string) error {
+	for _, token := range strings.Split(subject, ".") {
+		if token == "" {
+			return fmt.Errorf("%q has an empty token", subject)
+		}
+		if strings.ContainsAny(token, " \t\r\n\f*>") {
+			return fmt.Errorf("%q must not contain whitespace or wildcards ('*', '>')", subject)
+		}
+	}
+	return nil
+}
+
+// validateStreamName applies JetStream's stream naming rules, so a bad name fails before connecting.
+func validateStreamName(name string) error {
+	if len(name) > maxJetStreamNameLength {
+		return fmt.Errorf("%q is longer than %d characters", name, maxJetStreamNameLength)
+	}
+	if strings.ContainsAny(name, " \t\r\n\f.*>/\\") {
+		return fmt.Errorf("%q must not contain whitespace, '.', '*', '>', '/' or '\\'", name)
+	}
+	return nil
+}
+
+// validateBucketName applies the KV bucket naming rules, including the length of the backing stream.
+func validateBucketName(name string) error {
+	if !bucketNamePattern.MatchString(name) {
+		return fmt.Errorf("%q may only contain letters, digits, '_' and '-'", name)
+	}
+	return validateStreamName(kvStreamName(name))
 }
