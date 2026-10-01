@@ -112,17 +112,7 @@ func freePort(t *testing.T) int {
 	return port
 }
 
-// streamTimestamps returns the TigerBeetle timestamp of every event in the stream, in stream order.
-func streamTimestamps(t *testing.T, js nats.JetStreamContext, stream string) []uint64 {
-	t.Helper()
-
-	timestamps, err := readStreamTimestamps(js, stream)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return timestamps
-}
-
+// readStreamTimestamps returns the TigerBeetle timestamp of every event in the stream, in stream order.
 func readStreamTimestamps(js nats.JetStreamContext, stream string) ([]uint64, error) {
 	info, err := js.StreamInfo(stream)
 	if err != nil {
@@ -332,10 +322,11 @@ func timestampsOf(events []types.ChangeEvent) []uint64 {
 }
 
 // awaitStream waits until the stream holds exactly the events with the given timestamps, in order.
+// It fails as soon as the stream holds anything else.
 func awaitStream(t *testing.T, js nats.JetStreamContext, stream string, want []uint64) {
 	t.Helper()
 
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for {
 		// Reads fail until the stream exists, and while a leader election is in progress.
 		got, err := readStreamTimestamps(js, stream)

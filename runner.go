@@ -150,8 +150,12 @@ func replicate(
 		failures      int
 	)
 
-	// retryLater logs a recoverable failure and waits, backing off while failures repeat.
+	// retryLater waits after a failure that resuming from the stream can get past, backing off while
+	// failures repeat. Other failures are returned, to stop the run.
 	retryLater := func(err error) error {
+		if !isTransient(err) {
+			return err
+		}
 		failures++
 		delay := min(minRetryDelay<<min(failures-1, 16), maxRetryDelay)
 		log.Printf("warning: %v; resuming from the stream in %s", err, delay)
@@ -166,9 +170,6 @@ func replicate(
 
 		if publisher == nil {
 			resumeAt, err := recoverPosition(js, cfg)
-			if errors.Is(err, errCannotResume) {
-				return err
-			}
 			if err != nil {
 				if err := retryLater(err); err != nil {
 					return err
@@ -218,7 +219,7 @@ func replicate(
 
 		// The stream itself records progress. This checkpoint is only read if retention empties the
 		// stream, so a failure here doesn't risk losing or repeating events and need not stop publishing.
-		if err := writeProgress(progressKV, cfg, lastTimestamp); err != nil {
+		if err := writeProgress(progressKV, cfg, lastTimestamp, publisher.lastSeq); err != nil {
 			log.Printf("warning: %v", err)
 		}
 		log.Printf("published events=%d last_timestamp=%d stream_seq=%d", len(events), lastTimestamp, publisher.lastSeq)
