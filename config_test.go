@@ -30,7 +30,7 @@ func TestParseConfig_DefaultClusterScopedResources(t *testing.T) {
 		t.Fatalf("lock bucket = %q, want %q", got, want)
 	}
 
-	if got, want := cfg.subjectForEvent(7, "single_phase"), "tigerbeetle.cdc.7.single_phase"; got != want {
+	if got, want := cfg.subjectForEvent(7, "single_phase"), "tigerbeetle.cdc.42.7.single_phase"; got != want {
 		t.Fatalf("subject = %q, want %q", got, want)
 	}
 
