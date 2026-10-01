@@ -72,15 +72,13 @@ Requirements:
 
 ## Default resource model (cluster-scoped)
 
-For one-cluster-per-stream deployments (recommended), default resource names are derived from `--cluster-id`:
+Each TigerBeetle cluster gets its own stream. Default names and subjects include `--cluster-id`, so several clusters can share one NATS account:
 
 - Stream: `TB_CDC_EVENTS_<cluster>`
 - Progress KV bucket: `TB_CDC_PROGRESS_<cluster>`
 - Lock KV bucket: `TB_CDC_LOCK_<cluster>`
-
-Default structured event subject:
-
-`tigerbeetle.cdc.<ledger>.<event_type>`
+- Structured subject: `tigerbeetle.cdc.<cluster>.<ledger>.<event_type>`
+- Single-mode subject: `tigerbeetle.cdc.<cluster>`
 
 Headers include:
 
@@ -89,6 +87,15 @@ Headers include:
 - `transfer_code`
 - `debit_account_code`
 - `credit_account_code`
+
+## Upgrading from v0.1.x
+
+- Default subjects now include the cluster ID (`tigerbeetle.cdc.<cluster>.<ledger>.<event_type>`). An existing stream fails the startup config check. To keep the old subjects, pass `--subject-prefix=tigerbeetle.cdc` (or `--subject=tigerbeetle.cdc` in single mode). To move to the new ones, run once with `--stream-update` and update consumers' subject filters.
+- Publishing resumes from the stream's last event, not the KV checkpoint. No migration is needed.
+- `--timestamp-last` only moves the start forward and is safe to leave set. `--progress-every-events` is accepted but has no effect.
+- A second instance now waits for the lock instead of exiting.
+- An existing stream with `max_msgs` or `max_msgs_per_subject` limits fails the config check, because those limits silently drop events. Run with `--stream-update` to clear them.
+- Nothing else may publish to the event stream.
 
 ## Install options
 

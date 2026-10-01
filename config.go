@@ -33,8 +33,7 @@ const (
 	defaultEventStreamBase           = "TB_CDC_EVENTS"
 	defaultProgressBucketBase        = "TB_CDC_PROGRESS"
 	defaultLockBucketBase            = "TB_CDC_LOCK"
-	defaultSubjectPrefix             = "tigerbeetle.cdc"
-	defaultSingleSubject             = "tigerbeetle.cdc"
+	defaultSubjectBase               = "tigerbeetle.cdc"
 	defaultLockTTL                   = 30 * time.Second
 	defaultLockRefreshInterval       = 10 * time.Second
 	defaultDedupeWindow              = 2 * time.Minute
@@ -229,8 +228,8 @@ func parseConfig(args []string, version string) (config, error) {
 	fs.DurationVar(&cfg.lockRefresh, "lock-refresh", defaultLockRefreshInterval, "Lock refresh interval")
 
 	fs.StringVar(&subjectModeRaw, "subject-mode", string(subjectModeStructured), "Subject mode: structured or single")
-	fs.StringVar(&cfg.subjectPrefix, "subject-prefix", defaultSubjectPrefix, "Prefix for structured subjects")
-	fs.StringVar(&cfg.singleSubject, "subject", defaultSingleSubject, "Subject used when --subject-mode=single")
+	fs.StringVar(&cfg.subjectPrefix, "subject-prefix", "", "Prefix for structured subjects (default: tigerbeetle.cdc.<cluster>)")
+	fs.StringVar(&cfg.singleSubject, "subject", "", "Subject used when --subject-mode=single (default: tigerbeetle.cdc.<cluster>)")
 
 	fs.StringVar(&publishModeRaw, "publish-mode", string(defaultPublishMode), "Publish mode: async or sync")
 	fs.IntVar(&cfg.publishAsyncMaxPending, "publish-async-max-pending", defaultPublishAsyncPending, "Max unacknowledged messages in async mode")
@@ -330,7 +329,7 @@ func parseConfig(args []string, version string) (config, error) {
 	case subjectModeStructured:
 		cfg.subjectPrefix = strings.TrimSuffix(strings.TrimSpace(cfg.subjectPrefix), ".")
 		if cfg.subjectPrefix == "" {
-			return config{}, fmt.Errorf("--subject-prefix cannot be empty in structured mode")
+			cfg.subjectPrefix = defaultSubject(clusterIDDecimal)
 		}
 		if err := validateLiteralSubject(cfg.subjectPrefix); err != nil {
 			return config{}, fmt.Errorf("invalid --subject-prefix: %w", err)
@@ -338,7 +337,7 @@ func parseConfig(args []string, version string) (config, error) {
 	case subjectModeSingle:
 		cfg.singleSubject = strings.TrimSpace(cfg.singleSubject)
 		if cfg.singleSubject == "" {
-			return config{}, fmt.Errorf("--subject cannot be empty in single mode")
+			cfg.singleSubject = defaultSubject(clusterIDDecimal)
 		}
 		if err := validateLiteralSubject(cfg.singleSubject); err != nil {
 			return config{}, fmt.Errorf("invalid --subject: %w", err)
@@ -493,6 +492,12 @@ func storageTypeLabel(storage nats.StorageType) string {
 	default:
 		return fmt.Sprintf("storage(%d)", storage)
 	}
+}
+
+// defaultSubject is the default subject (single mode) or subject prefix (structured mode). It includes
+// the cluster ID so that streams for different clusters don't claim overlapping subjects.
+func defaultSubject(clusterID string) string {
+	return defaultSubjectBase + "." + clusterID
 }
 
 func clusterScopedResourceName(base string, clusterID string) string {

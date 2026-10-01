@@ -155,3 +155,17 @@ func streamMaxAge(t *testing.T, js nats.JetStreamContext, stream string) time.Du
 	}
 	return info.Config.MaxAge
 }
+
+func TestRun_ClustersShareANATSAccountWithDefaultSubjects(t *testing.T) {
+	t.Parallel()
+	url := startJetStream(t)
+	js := connectJetStream(t, url)
+
+	first := testConfig(t, url)
+	second := testConfig(t, url, "--cluster-id=8")
+	startRun(t, first, newFakeSource(testEvent(10)))
+	startRun(t, second, newFakeSource(testEvent(20)))
+
+	awaitStream(t, js, first.eventStream, []uint64{10})
+	awaitStream(t, js, second.eventStream, []uint64{20})
+}
